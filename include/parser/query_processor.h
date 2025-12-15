@@ -45,6 +45,8 @@ enum class ASTNodeType {
     INSERT_STATEMENT,
     UPDATE_STATEMENT,
     DELETE_STATEMENT,
+    SET_CLAUSE,
+    ASSIGNMENT,
     ORDER_BY,
     SELECT_LIST,
     FROM_CLAUSE,
@@ -258,5 +260,9 @@ private:
     std::shared_ptr<PhysicalPlanNode> lastPhysicalPlan_;
     void executePhysicalPlan(std::shared_ptr<PhysicalPlanNode> plan);
 };
+
+// Helpers that execute parsed UPDATE/DELETE statements and return affected rows.
+std::size_t executeUpdateStatement(DatabaseSystem& db, std::shared_ptr<ASTNode> updateAst);
+std::size_t executeDeleteStatement(DatabaseSystem& db, std::shared_ptr<ASTNode> deleteAst);
 
 } // namespace dbms

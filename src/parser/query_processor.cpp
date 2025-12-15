@@ -20,6 +20,8 @@ std::string ASTNode::toString(int indent) const {
         case ASTNodeType::INSERT_STATEMENT: oss << "INSERT_STMT"; break;
         case ASTNodeType::UPDATE_STATEMENT: oss << "UPDATE_STMT"; break;
         case ASTNodeType::DELETE_STATEMENT: oss << "DELETE_STMT"; break;
+        case ASTNodeType::SET_CLAUSE: oss << "SET"; break;
+        case ASTNodeType::ASSIGNMENT: oss << "ASSIGN"; break;
         case ASTNodeType::ORDER_BY: oss << "ORDER_BY"; break;
         case ASTNodeType::SELECT_LIST: oss << "SELECT_LIST"; break;
         case ASTNodeType::FROM_CLAUSE: oss << "FROM"; break;
@@ -123,6 +125,103 @@ std::string RelAlgNode::toString(int indent) const {
 
     return oss.str();
 }
+
+namespace {
+
+bool isNumericLiteral(const std::string& value) {
+    if (value.empty()) {
+        return false;
+    }
+    std::size_t pos = 0;
+    if (value[0] == '-') {
+        pos = 1;
+    }
+    bool hasDigit = false;
+    for (; pos < value.size(); ++pos) {
+        char ch = value[pos];
+        if (std::isdigit(static_cast<unsigned char>(ch))) {
+            hasDigit = true;
+            continue;
+        }
+        if (ch == '.') {
+            continue;
+        }
+        return false;
+    }
+    return hasDigit;
+}
+
+std::string astToExpressionString(const std::shared_ptr<ASTNode>& node) {
+    if (!node) {
+        return "";
+    }
+
+    switch (node->nodeType) {
+        case ASTNodeType::COMPARISON:
+            if (node->children.size() >= 2) {
+                return "(" + astToExpressionString(node->children[0]) + " " +
+                       node->value + " " + astToExpressionString(node->children[1]) + ")";
+            }
+            break;
+        case ASTNodeType::AND_EXPR:
+            if (node->children.size() >= 2) {
+                return "(" + astToExpressionString(node->children[0]) + " AND " +
+                       astToExpressionString(node->children[1]) + ")";
+            }
+            break;
+        case ASTNodeType::OR_EXPR:
+            if (node->children.size() >= 2) {
+                return "(" + astToExpressionString(node->children[0]) + " OR " +
+                       astToExpressionString(node->children[1]) + ")";
+            }
+            break;
+        case ASTNodeType::NOT_EXPR:
+            if (!node->children.empty()) {
+                return "(NOT " + astToExpressionString(node->children[0]) + ")";
+            }
+            break;
+        case ASTNodeType::BINARY_OP:
+            if (node->children.size() >= 2) {
+                return "(" + astToExpressionString(node->children[0]) + " " + node->value +
+                       " " + astToExpressionString(node->children[1]) + ")";
+            }
+            break;
+        case ASTNodeType::UNARY_OP:
+            if (!node->children.empty()) {
+                return "(" + node->value + astToExpressionString(node->children[0]) + ")";
+            }
+            break;
+        case ASTNodeType::ASSIGNMENT:
+            if (node->children.size() >= 2) {
+                return "(" + astToExpressionString(node->children[0]) + " = " +
+                       astToExpressionString(node->children[1]) + ")";
+            }
+            break;
+        case ASTNodeType::COLUMN_REF:
+            return node->value;
+        case ASTNodeType::LITERAL:
+            if (isNumericLiteral(node->value)) {
+                return node->value;
+            }
+            return "'" + node->value + "'";
+        default:
+            break;
+    }
+
+    return node->value;
+}
+
+std::shared_ptr<Schema> buildSchemaFromTable(const Table& table) {
+    auto schema = std::make_shared<Schema>();
+    const auto& columns = table.schema().columns();
+    const auto& tableName = table.schema().name();
+    for (std::size_t i = 0; i < columns.size(); ++i) {
+        schema->addColumn(ColumnInfo{columns[i].name, columns[i].type, i, tableName});
+    }
+    return schema;
+}
+
+} // namespace
 
 // ============== PhysicalPlanNode 实现 ==============
 std::string PhysicalPlanNode::toString(int indent) const {
@@ -532,15 +631,16 @@ std::shared_ptr<ASTNode> Parser::parseUpdateStatement() {
 
     consume(TokenType::SET, "Expected SET");
 
-    // Parse SET clause (simplified)
+    auto setClause = std::make_shared<ASTNode>(ASTNodeType::SET_CLAUSE);
     do {
-        Token col = consume(TokenType::IDENTIFIER, "Expected column name");
+        std::string columnName = parseQualifiedIdentifier();
         consume(TokenType::EQUAL, "Expected =");
-
-        if (check(TokenType::STRING_LITERAL) || check(TokenType::NUMBER_LITERAL)) {
-            advance();
-        }
+        auto assignment = std::make_shared<ASTNode>(ASTNodeType::ASSIGNMENT, "=");
+        assignment->addChild(std::make_shared<ASTNode>(ASTNodeType::COLUMN_REF, columnName));
+        assignment->addChild(parseExpression());
+        setClause->addChild(assignment);
     } while (match(TokenType::COMMA));
+    stmt->addChild(setClause);
 
     if (match(TokenType::WHERE)) {
         stmt->addChild(parseWhereClause());
@@ -1030,56 +1130,7 @@ std::shared_ptr<RelAlgNode> LogicalPlanGenerator::processSelectList(
 }
 
 std::string LogicalPlanGenerator::extractCondition(std::shared_ptr<ASTNode> node) {
-    if (!node) return "";
-
-    std::ostringstream oss;
-
-    switch (node->nodeType) {
-        case ASTNodeType::COMPARISON:
-            if (node->children.size() >= 2) {
-                oss << extractCondition(node->children[0]) << " "
-                    << node->value << " "
-                    << extractCondition(node->children[1]);
-            }
-            break;
-        case ASTNodeType::AND_EXPR:
-            if (node->children.size() >= 2) {
-                oss << "(" << extractCondition(node->children[0]) << " AND "
-                    << extractCondition(node->children[1]) << ")";
-            }
-            break;
-        case ASTNodeType::OR_EXPR:
-            if (node->children.size() >= 2) {
-                oss << "(" << extractCondition(node->children[0]) << " OR "
-                    << extractCondition(node->children[1]) << ")";
-            }
-            break;
-        case ASTNodeType::COLUMN_REF:
-            oss << node->value;
-            break;
-        case ASTNodeType::LITERAL:
-            // Check if it's a string literal (not a number)
-            {
-                bool isNumber = !node->value.empty();
-                for (char c : node->value) {
-                    if (!std::isdigit(c) && c != '.' && c != '-') {
-                        isNumber = false;
-                        break;
-                    }
-                }
-                if (isNumber) {
-                    oss << node->value;
-                } else {
-                    oss << "'" << node->value << "'";
-                }
-            }
-            break;
-        default:
-            oss << node->value;
-            break;
-    }
-
-    return oss.str();
+    return astToExpressionString(node);
 }
 
 // ============== LogicalOptimizer 实现 ==============
@@ -1476,6 +1527,177 @@ std::string PhysicalPlanGenerator::stripTablePrefix(const std::string& name) {
     return name.substr(pos + 1);
 }
 
+std::size_t executeUpdateStatement(DatabaseSystem& db, std::shared_ptr<ASTNode> updateAst) {
+    if (!updateAst || updateAst->nodeType != ASTNodeType::UPDATE_STATEMENT) {
+        throw std::invalid_argument("expected UPDATE statement AST");
+    }
+
+    std::string tableName;
+    std::shared_ptr<ASTNode> setClause;
+    std::shared_ptr<ASTNode> whereClause;
+    for (const auto& child : updateAst->children) {
+        if (child->nodeType == ASTNodeType::TABLE_REF) {
+            tableName = child->value;
+        } else if (child->nodeType == ASTNodeType::SET_CLAUSE) {
+            setClause = child;
+        } else if (child->nodeType == ASTNodeType::WHERE_CLAUSE) {
+            whereClause = child;
+        }
+    }
+
+    if (tableName.empty()) {
+        throw std::runtime_error("UPDATE missing target table");
+    }
+    if (!setClause) {
+        throw std::runtime_error("UPDATE missing SET clause");
+    }
+
+    const Table& table = db.getTable(tableName);
+    auto schema = buildSchemaFromTable(table);
+
+    // Build predicate from WHERE (optional)
+    std::unique_ptr<Expression> predicateExpr;
+    if (whereClause && !whereClause->children.empty()) {
+        std::string condition = astToExpressionString(whereClause->children[0]);
+        if (!condition.empty()) {
+            ExpressionParser parser;
+            predicateExpr = parser.parse(condition);
+        }
+    }
+    Expression* predicate = predicateExpr.get();
+
+    // Prepare assignments
+    struct AssignmentSpec {
+        std::size_t columnIndex{0};
+        std::unique_ptr<Expression> expression;
+    };
+    std::vector<AssignmentSpec> assignments;
+    for (const auto& assignmentNode : setClause->children) {
+        if (assignmentNode->children.size() < 2) {
+            continue;
+        }
+        const auto& columnNode = assignmentNode->children[0];
+        const auto& valueNode = assignmentNode->children[1];
+        auto colIndex = schema->findColumn(columnNode->value);
+        if (!colIndex) {
+            throw std::runtime_error("Unknown column in SET clause: " + columnNode->value);
+        }
+        std::string exprText = astToExpressionString(valueNode);
+        ExpressionParser parser;
+        auto expr = parser.parse(exprText);
+        assignments.push_back(AssignmentSpec{*colIndex, std::move(expr)});
+    }
+
+    if (assignments.empty()) {
+        throw std::runtime_error("UPDATE has no assignments to apply");
+    }
+
+    struct MatchedRow {
+        BlockAddress addr;
+        std::size_t slot{0};
+        Record record;
+    };
+    std::vector<MatchedRow> matches;
+
+    for (const auto& addr : table.blocks()) {
+        auto fetchResult = db.buffer().fetch(addr, false);
+        fetchResult.block.ensureInitialized(db.blockSize());
+        fetchResult.block.page.forEachRecord(
+            [&](std::size_t slotIdx, const Record& record) {
+                Tuple tuple{record.values, schema};
+                bool isMatch = true;
+                if (predicate) {
+                    isMatch = predicate->evaluate(tuple).asBool();
+                }
+                if (isMatch) {
+                    matches.push_back(MatchedRow{addr, slotIdx, record});
+                }
+            });
+    }
+
+    std::size_t affected = 0;
+    for (const auto& row : matches) {
+        Tuple tuple{row.record.values, schema};
+        Record updated = row.record;
+        for (const auto& assignment : assignments) {
+            ExprValue value = assignment.expression->evaluate(tuple);
+            if (assignment.columnIndex >= updated.values.size()) {
+                throw std::runtime_error("assignment column index out of range");
+            }
+            updated.values[assignment.columnIndex] = value.asString();
+        }
+        if (db.updateRecord(row.addr, row.slot, std::move(updated))) {
+            ++affected;
+        }
+    }
+
+    return affected;
+}
+
+std::size_t executeDeleteStatement(DatabaseSystem& db, std::shared_ptr<ASTNode> deleteAst) {
+    if (!deleteAst || deleteAst->nodeType != ASTNodeType::DELETE_STATEMENT) {
+        throw std::invalid_argument("expected DELETE statement AST");
+    }
+
+    std::string tableName;
+    std::shared_ptr<ASTNode> whereClause;
+    for (const auto& child : deleteAst->children) {
+        if (child->nodeType == ASTNodeType::TABLE_REF) {
+            tableName = child->value;
+        } else if (child->nodeType == ASTNodeType::WHERE_CLAUSE) {
+            whereClause = child;
+        }
+    }
+
+    if (tableName.empty()) {
+        throw std::runtime_error("DELETE missing target table");
+    }
+
+    const Table& table = db.getTable(tableName);
+    auto schema = buildSchemaFromTable(table);
+
+    std::unique_ptr<Expression> predicateExpr;
+    if (whereClause && !whereClause->children.empty()) {
+        std::string condition = astToExpressionString(whereClause->children[0]);
+        if (!condition.empty()) {
+            ExpressionParser parser;
+            predicateExpr = parser.parse(condition);
+        }
+    }
+    Expression* predicate = predicateExpr.get();
+
+    struct TargetRow {
+        BlockAddress addr;
+        std::size_t slot{0};
+    };
+    std::vector<TargetRow> targets;
+
+    for (const auto& addr : table.blocks()) {
+        auto fetchResult = db.buffer().fetch(addr, false);
+        fetchResult.block.ensureInitialized(db.blockSize());
+        fetchResult.block.page.forEachRecord(
+            [&](std::size_t slotIdx, const Record& record) {
+                Tuple tuple{record.values, schema};
+                bool isMatch = true;
+                if (predicate) {
+                    isMatch = predicate->evaluate(tuple).asBool();
+                }
+                if (isMatch) {
+                    targets.push_back(TargetRow{addr, slotIdx});
+                }
+            });
+    }
+
+    std::size_t affected = 0;
+    for (const auto& target : targets) {
+        if (db.deleteRecord(target.addr, target.slot)) {
+            ++affected;
+        }
+    }
+
+    return affected;
+}
+
 // ============== QueryProcessor 实现 ==============
 QueryProcessor::QueryProcessor(DatabaseSystem& db) : db_(db) {}
 
@@ -1511,32 +1733,49 @@ void QueryProcessor::processQuery(const std::string& sql) {
         analyzer.analyze(lastAST_);
         std::cout << "Semantic analysis passed - all tables and columns are valid\n\n";
 
-        // 4. Logical Query Plan Generation
-        std::cout << "==> Step 4: Logical Query Plan (逻辑查询计划 - 关系代数表达式)\n";
-        LogicalPlanGenerator planGen;
-        lastLogicalPlan_ = planGen.generateLogicalPlan(lastAST_);
+        // Reset previous plans before executing current statement
+        lastLogicalPlan_.reset();
+        lastOptimizedPlan_.reset();
+        lastPhysicalPlan_.reset();
 
-        std::cout << "Initial Logical Plan:\n";
-        std::cout << lastLogicalPlan_->toString() << "\n";
+        if (lastAST_->nodeType == ASTNodeType::UPDATE_STATEMENT) {
+            std::cout << "==> Step 4: Execute UPDATE statement\n";
+            std::size_t affected = executeUpdateStatement(db_, lastAST_);
+            std::cout << "Rows updated: " << affected << "\n\n";
+        } else if (lastAST_->nodeType == ASTNodeType::DELETE_STATEMENT) {
+            std::cout << "==> Step 4: Execute DELETE statement\n";
+            std::size_t affected = executeDeleteStatement(db_, lastAST_);
+            std::cout << "Rows deleted: " << affected << "\n\n";
+        } else if (lastAST_->nodeType == ASTNodeType::SELECT_STATEMENT) {
+            // 4. Logical Query Plan Generation
+            std::cout << "==> Step 4: Logical Query Plan (逻辑查询计划 - 关系代数表达式)\n";
+            LogicalPlanGenerator planGen;
+            lastLogicalPlan_ = planGen.generateLogicalPlan(lastAST_);
 
-        // 5. Logical Query Optimization
-        std::cout << "==> Step 5: Optimized Logical Plan (优化后的逻辑计划)\n";
-        LogicalOptimizer optimizer;
-        lastOptimizedPlan_ = optimizer.optimize(lastLogicalPlan_);
+            std::cout << "Initial Logical Plan:\n";
+            std::cout << lastLogicalPlan_->toString() << "\n";
 
-        std::cout << "Optimized Logical Plan:\n";
-        std::cout << lastOptimizedPlan_->toString() << "\n";
+            // 5. Logical Query Optimization
+            std::cout << "==> Step 5: Optimized Logical Plan (优化后的逻辑计划)\n";
+            LogicalOptimizer optimizer;
+            lastOptimizedPlan_ = optimizer.optimize(lastLogicalPlan_);
 
-        // 6. Physical Query Plan Generation
-        std::cout << "==> Step 6: Physical Query Plan (物理查询计划)\n";
-        PhysicalPlanGenerator physGen(db_);
-        lastPhysicalPlan_ = physGen.generatePhysicalPlan(lastOptimizedPlan_);
+            std::cout << "Optimized Logical Plan:\n";
+            std::cout << lastOptimizedPlan_->toString() << "\n";
 
-        std::cout << "Physical Execution Plan:\n";
-        std::cout << lastPhysicalPlan_->toString() << "\n";
+            // 6. Physical Query Plan Generation
+            std::cout << "==> Step 6: Physical Query Plan (物理查询计划)\n";
+            PhysicalPlanGenerator physGen(db_);
+            lastPhysicalPlan_ = physGen.generatePhysicalPlan(lastOptimizedPlan_);
 
-        // 7. Execute the physical plan
-        executePhysicalPlan(lastPhysicalPlan_);
+            std::cout << "Physical Execution Plan:\n";
+            std::cout << lastPhysicalPlan_->toString() << "\n";
+
+            // 7. Execute the physical plan
+            executePhysicalPlan(lastPhysicalPlan_);
+        } else {
+            throw std::runtime_error("Unsupported SQL statement");
+        }
 
         std::cout << "========================================\n";
         std::cout << "Query processing completed successfully!\n";

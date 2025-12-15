@@ -690,6 +690,11 @@ int main(int argc, char **argv) {
                 db.executeSQL(line);
                 continue;
             }
+            if (startsWithCaseInsensitive(line, "update") ||
+                startsWithCaseInsensitive(line, "delete")) {
+                db.executeSQL(line);
+                continue;
+            }
 
             std::cout << "Unknown command. Type HELP for guidance.\n";
         }

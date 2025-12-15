@@ -605,6 +605,20 @@ ResultSet runSql(DatabaseSystem &db, const std::string &sql) {
     auto ast = parser.parse();
     SemanticAnalyzer analyzer(db);
     analyzer.analyze(ast);
+
+    if (ast->nodeType == ASTNodeType::UPDATE_STATEMENT) {
+        executeUpdateStatement(db, ast);
+        return ResultSet{};
+    }
+    if (ast->nodeType == ASTNodeType::DELETE_STATEMENT) {
+        executeDeleteStatement(db, ast);
+        return ResultSet{};
+    }
+
+    if (ast->nodeType != ASTNodeType::SELECT_STATEMENT) {
+        throw std::runtime_error("runSql only supports SELECT/UPDATE/DELETE");
+    }
+
     LogicalPlanGenerator logicalGen;
     auto logicalPlan = logicalGen.generateLogicalPlan(ast);
     LogicalOptimizer optimizer;
@@ -713,6 +727,82 @@ void testLeftAndRightJoinSupport() {
             "right join should set NULL when no matching user exists");
 }
 
+void testSqlUpdateExecution() {
+    const fs::path tempRoot = fs::current_path() / "tmp_dbms_tests" / "sql_update";
+    removeIfExists(tempRoot);
+    WorkingDirGuard guard(tempRoot);
+    removeIfExists("storage");
+
+    const std::size_t blockSizeBytes = 512;
+    const std::size_t mainMemoryBytes = 2 * 1024 * 1024; // 2 MiB
+    const std::size_t diskBytes = 8 * 1024 * 1024;       // 8 MiB
+    DatabaseSystem db(blockSizeBytes, mainMemoryBytes, diskBytes);
+
+    TableSchema users(
+        "users",
+        {
+            {"id", ColumnType::Integer, 16},
+            {"name", ColumnType::String, 32},
+            {"age", ColumnType::Integer, 8},
+        });
+    db.registerTable(users);
+
+    db.insertRecord("users", Record{"1", "Alice", "30"});
+    db.insertRecord("users", Record{"2", "Bob", "42"});
+    db.insertRecord("users", Record{"3", "Carol", "28"});
+
+    auto before = runSql(db, "SELECT name, age FROM users WHERE id = 1");
+    require(before.size() == 1, "baseline row should exist before update");
+
+    runSql(db, "UPDATE users SET name = 'Alicia', age = age + 1 WHERE id = 1");
+
+    auto after = runSql(db, "SELECT name, age FROM users WHERE id = 1");
+    require(after.size() == 1, "update should keep the matching row present");
+    require(after.getTuple(0).getValue("name") == "Alicia", "name should be updated");
+    require(after.getTuple(0).getValue("age") == "31", "age should be incremented");
+
+    auto untouched = runSql(db, "SELECT name FROM users WHERE id = 2");
+    require(untouched.size() == 1 && untouched.getTuple(0).getValue("name") == "Bob",
+            "non-matching rows should not be modified");
+}
+
+void testSqlDeleteExecution() {
+    const fs::path tempRoot = fs::current_path() / "tmp_dbms_tests" / "sql_delete";
+    removeIfExists(tempRoot);
+    WorkingDirGuard guard(tempRoot);
+    removeIfExists("storage");
+
+    const std::size_t blockSizeBytes = 512;
+    const std::size_t mainMemoryBytes = 2 * 1024 * 1024; // 2 MiB
+    const std::size_t diskBytes = 8 * 1024 * 1024;       // 8 MiB
+    DatabaseSystem db(blockSizeBytes, mainMemoryBytes, diskBytes);
+
+    TableSchema users(
+        "users",
+        {
+            {"id", ColumnType::Integer, 16},
+            {"name", ColumnType::String, 32},
+        });
+    db.registerTable(users);
+
+    db.insertRecord("users", Record{"1", "Alice"});
+    db.insertRecord("users", Record{"2", "Bob"});
+    db.insertRecord("users", Record{"3", "Carol"});
+
+    runSql(db, "DELETE FROM users WHERE id = 2");
+    auto remaining = runSql(db, "SELECT id FROM users ORDER BY id");
+    require(remaining.size() == 2, "one row should be removed by delete");
+    std::vector<std::string> ids;
+    for (const auto &row : remaining) {
+        ids.push_back(row.getValue("id"));
+    }
+    require((ids == std::vector<std::string>{"1", "3"}), "deleted id should be missing");
+
+    runSql(db, "DELETE FROM users");
+    auto empty = runSql(db, "SELECT id FROM users");
+    require(empty.size() == 0, "delete without where should clear all rows");
+}
+
 void testSortOperatorOrdersResults() {
     const fs::path tempRoot = fs::current_path() / "tmp_dbms_tests" / "sort_operator";
     removeIfExists(tempRoot);
@@ -817,6 +907,8 @@ int main() {
     runner.run("Corrupted index file triggers rebuild", testCorruptedIndexFileRebuild);
     runner.run("SQL DISTINCT with ORDER BY", testSqlDistinctAndOrderBy);
     runner.run("LEFT/RIGHT join execution", testLeftAndRightJoinSupport);
+    runner.run("SQL UPDATE applies SET with WHERE", testSqlUpdateExecution);
+    runner.run("SQL DELETE removes matching rows", testSqlDeleteExecution);
     runner.run("Sort operator orders tuples", testSortOperatorOrdersResults);
     runner.run("Aggregate operator group by + having", testAggregateGroupByHaving);
     return runner.summary() == 0 ? 0 : 1;
