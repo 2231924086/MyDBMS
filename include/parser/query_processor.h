@@ -17,7 +17,7 @@ class DatabaseSystem;
 enum class TokenType {
     // Keywords
     SELECT, FROM, WHERE, AND, OR, NOT, JOIN, ON, INNER, LEFT, RIGHT,
-    ORDER, BY, GROUP, HAVING, AS, DISTINCT, ALL,
+    ORDER, BY, GROUP, HAVING, AS, DISTINCT, ALL, LIMIT, OFFSET,
     INSERT, INTO, VALUES, UPDATE, SET, DELETE,
     // Operators
     EQUAL, NOT_EQUAL, LESS, LESS_EQUAL, GREATER, GREATER_EQUAL,
@@ -61,15 +61,21 @@ enum class ASTNodeType {
     AND_EXPR,
     OR_EXPR,
     NOT_EXPR,
-    COMPARISON
+    COMPARISON,
+    FUNCTION_CALL,
+    SUBQUERY,
+    GROUP_BY,
+    HAVING_CLAUSE,
+    LIMIT_CLAUSE
 };
 
 struct ASTNode {
     ASTNodeType nodeType;
     std::string value;
+    std::string alias; // Optional alias for select items or table references
     std::vector<std::shared_ptr<ASTNode>> children;
-    explicit ASTNode(ASTNodeType type, std::string val = "")
-        : nodeType(type), value(std::move(val)) {}
+    explicit ASTNode(ASTNodeType type, std::string val = "", std::string al = "")
+        : nodeType(type), value(std::move(val)), alias(std::move(al)) {}
     void addChild(std::shared_ptr<ASTNode> child) { children.push_back(std::move(child)); }
     std::string toString(int indent = 0) const;
 };
@@ -86,17 +92,25 @@ enum class RelAlgOpType {
     kIntersect,
     kDifference,
     kSort,
-    kGroup
+    kGroup,
+    kRename,
+    kLimit
 };
 
 struct RelAlgNode {
     RelAlgOpType opType;
     std::string operationDesc;
     std::vector<std::string> columns;
+    std::vector<std::string> aggregates;
     std::string tableName;
+    std::string alias;
     std::string condition;
+    std::string havingClause;
     JoinType joinType{JoinType::kInner};
     std::string orderByClause;
+    std::size_t limit{0};
+    std::size_t offset{0};
+    bool hasLimit{false};
     std::vector<std::shared_ptr<RelAlgNode>> children;
     explicit RelAlgNode(RelAlgOpType type, std::string desc = "")
         : opType(type), operationDesc(std::move(desc)) {}
@@ -115,7 +129,9 @@ enum class PhysicalOpType {
     kHashJoin,
     kMergeJoin,
     kSort,
-    kAggregate
+    kAggregate,
+    kLimit,
+    kAlias
 };
 
 struct PhysicalPlanNode {
@@ -174,7 +190,11 @@ private:
     std::shared_ptr<ASTNode> parseUpdateStatement();
     std::shared_ptr<ASTNode> parseDeleteStatement();
     std::shared_ptr<ASTNode> parseSelectList();
+    std::shared_ptr<ASTNode> parseSelectItem();
     std::shared_ptr<ASTNode> parseOrderByClause();
+    std::shared_ptr<ASTNode> parseGroupByClause();
+    std::shared_ptr<ASTNode> parseHavingClause();
+    std::shared_ptr<ASTNode> parseLimitClause();
     std::shared_ptr<ASTNode> parseFromClause();
     std::shared_ptr<ASTNode> parseWhereClause();
     std::shared_ptr<ASTNode> parseExpression();

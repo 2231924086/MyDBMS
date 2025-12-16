@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -156,7 +157,9 @@ void AggregateOperator::prepareAggregates(const Schema& childSchema) {
         agg.exprNode = parser.parse(agg.expression);
         agg.resultType = inferExpressionType(*agg.exprNode, childSchema);
 
-        if (agg.func == AggFunc::AVG) {
+        if (agg.func == AggFunc::AVG ||
+            agg.func == AggFunc::STDDEV ||
+            agg.func == AggFunc::VARIANCE) {
             agg.resultType = ColumnType::Double;
         } else if (agg.func == AggFunc::SUM &&
                    agg.resultType == ColumnType::String) {
@@ -207,6 +210,18 @@ void AggregateOperator::accumulateTuple(
                 acc.doubleSum += (value.type == ExprValue::Type::DOUBLE)
                                      ? value.asDouble()
                                      : static_cast<double>(value.asInt());
+                acc.count += 1;
+                acc.hasValue = true;
+                break;
+            }
+            case AggFunc::STDDEV:
+            case AggFunc::VARIANCE: {
+                ExprValue value = agg.exprNode->evaluate(tuple);
+                double v = (value.type == ExprValue::Type::DOUBLE)
+                               ? value.asDouble()
+                               : static_cast<double>(value.asInt());
+                acc.doubleSum += v;
+                acc.doubleSumSquares += v * v;
                 acc.count += 1;
                 acc.hasValue = true;
                 break;
@@ -279,6 +294,31 @@ Tuple AggregateOperator::buildOutputTuple(
             case AggFunc::MAX:
                 tuple.values.push_back(acc.hasValue ? acc.extreme.asString() : "NULL");
                 break;
+            case AggFunc::VARIANCE: {
+                if (acc.count == 0) {
+                    tuple.values.push_back("0");
+                } else {
+                    double mean = acc.doubleSum / static_cast<double>(acc.count);
+                    double variance = (acc.doubleSumSquares / static_cast<double>(acc.count)) -
+                                      (mean * mean);
+                    tuple.values.push_back(std::to_string(variance));
+                }
+                break;
+            }
+            case AggFunc::STDDEV: {
+                if (acc.count == 0) {
+                    tuple.values.push_back("0");
+                } else {
+                    double mean = acc.doubleSum / static_cast<double>(acc.count);
+                    double variance = (acc.doubleSumSquares / static_cast<double>(acc.count)) -
+                                      (mean * mean);
+                    if (variance < 0) {
+                        variance = 0;
+                    }
+                    tuple.values.push_back(std::to_string(std::sqrt(variance)));
+                }
+                break;
+            }
         }
     }
 
@@ -336,6 +376,10 @@ std::string AggregateOperator::funcName(AggFunc func) {
             return "MIN";
         case AggFunc::MAX:
             return "MAX";
+        case AggFunc::STDDEV:
+            return "STDDEV";
+        case AggFunc::VARIANCE:
+            return "VARIANCE";
     }
     return "AGG";
 }
@@ -357,4 +401,3 @@ bool AggregateOperator::GroupKeyEqual::operator()(
 }
 
 } // namespace dbms
-

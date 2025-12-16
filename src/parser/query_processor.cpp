@@ -6,6 +6,7 @@
 #include <sstream>
 #include <iostream>
 #include <algorithm>
+#include <functional>
 
 namespace dbms {
 
@@ -37,10 +38,18 @@ std::string ASTNode::toString(int indent) const {
         case ASTNodeType::OR_EXPR: oss << "OR"; break;
         case ASTNodeType::NOT_EXPR: oss << "NOT"; break;
         case ASTNodeType::COMPARISON: oss << "COMPARISON"; break;
+        case ASTNodeType::FUNCTION_CALL: oss << "FUNC"; break;
+        case ASTNodeType::SUBQUERY: oss << "SUBQUERY"; break;
+        case ASTNodeType::GROUP_BY: oss << "GROUP_BY"; break;
+        case ASTNodeType::HAVING_CLAUSE: oss << "HAVING"; break;
+        case ASTNodeType::LIMIT_CLAUSE: oss << "LIMIT"; break;
     }
 
     if (!value.empty()) {
         oss << ", value=\"" << value << "\"";
+    }
+    if (!alias.empty()) {
+        oss << ", alias=\"" << alias << "\"";
     }
     oss << ")";
 
@@ -109,6 +118,35 @@ std::string RelAlgNode::toString(int indent) const {
             break;
         case RelAlgOpType::kGroup:
             oss << "γ GROUP";
+            if (!columns.empty()) {
+                oss << "[";
+                for (std::size_t i = 0; i < columns.size(); ++i) {
+                    if (i > 0) oss << ", ";
+                    oss << columns[i];
+                }
+                oss << "]";
+            }
+            if (!aggregates.empty()) {
+                oss << " Agg(";
+                for (std::size_t i = 0; i < aggregates.size(); ++i) {
+                    if (i > 0) oss << ", ";
+                    oss << aggregates[i];
+                }
+                oss << ")";
+            }
+            if (!havingClause.empty()) {
+                oss << " HAVING[" << havingClause << "]";
+            }
+            break;
+        case RelAlgOpType::kRename:
+            oss << "ρ RENAME(" << alias << ")";
+            break;
+        case RelAlgOpType::kLimit:
+            oss << "λ LIMIT[" << limit;
+            if (offset != 0) {
+                oss << " OFFSET " << offset;
+            }
+            oss << "]";
             break;
     }
 
@@ -204,6 +242,23 @@ std::string astToExpressionString(const std::shared_ptr<ASTNode>& node) {
                 return node->value;
             }
             return "'" + node->value + "'";
+        case ASTNodeType::FUNCTION_CALL: {
+            std::string expr = node->value + "(";
+            for (std::size_t i = 0; i < node->children.size(); ++i) {
+                if (i > 0) {
+                    expr += ", ";
+                }
+                if (node->children[i]->nodeType == ASTNodeType::STAR) {
+                    expr += "*";
+                } else {
+                    expr += astToExpressionString(node->children[i]);
+                }
+            }
+            expr += ")";
+            return expr;
+        }
+        case ASTNodeType::SUBQUERY:
+            return "(SUBQUERY)";
         default:
             break;
     }
@@ -240,6 +295,8 @@ std::string PhysicalPlanNode::toString(int indent) const {
         case PhysicalOpType::kMergeJoin: oss << "MERGE_JOIN"; break;
         case PhysicalOpType::kSort: oss << "SORT"; break;
         case PhysicalOpType::kAggregate: oss << "AGGREGATE"; break;
+        case PhysicalOpType::kLimit: oss << "LIMIT"; break;
+        case PhysicalOpType::kAlias: oss << "ALIAS"; break;
     }
     oss << "]";
 
@@ -315,6 +372,7 @@ TokenType Lexer::getKeywordType(const std::string& word) const {
         {"BY", TokenType::BY}, {"GROUP", TokenType::GROUP},
         {"HAVING", TokenType::HAVING}, {"AS", TokenType::AS},
         {"DISTINCT", TokenType::DISTINCT}, {"ALL", TokenType::ALL},
+        {"LIMIT", TokenType::LIMIT}, {"OFFSET", TokenType::OFFSET},
         {"INSERT", TokenType::INSERT}, {"INTO", TokenType::INTO},
         {"VALUES", TokenType::VALUES}, {"UPDATE", TokenType::UPDATE},
         {"SET", TokenType::SET}, {"DELETE", TokenType::DELETE}
@@ -588,10 +646,33 @@ std::shared_ptr<ASTNode> Parser::parseSelectStatement() {
         stmt->addChild(parseWhereClause());
     }
 
+    // Parse GROUP BY clause
+    if (match(TokenType::GROUP)) {
+        consume(TokenType::BY, "Expected BY after GROUP");
+        stmt->addChild(parseGroupByClause());
+    }
+
+    // Parse HAVING clause
+    if (match(TokenType::HAVING)) {
+        stmt->addChild(parseHavingClause());
+    }
+
     // Parse ORDER BY clause
     if (match(TokenType::ORDER)) {
         consume(TokenType::BY, "Expected BY after ORDER");
         stmt->addChild(parseOrderByClause());
+    }
+
+    // Parse LIMIT/OFFSET clause
+    if (match(TokenType::LIMIT)) {
+        stmt->addChild(parseLimitClause());
+    } else if (match(TokenType::OFFSET)) {
+        // Support OFFSET without LIMIT by treating limit as unlimited (0)
+        auto limitNode = std::make_shared<ASTNode>(ASTNodeType::LIMIT_CLAUSE);
+        limitNode->addChild(std::make_shared<ASTNode>(ASTNodeType::LITERAL, "0"));
+        Token off = consume(TokenType::NUMBER_LITERAL, "Expected numeric OFFSET value");
+        limitNode->addChild(std::make_shared<ASTNode>(ASTNodeType::LITERAL, off.lexeme));
+        stmt->addChild(limitNode);
     }
 
     return stmt;
@@ -675,12 +756,7 @@ std::shared_ptr<ASTNode> Parser::parseSelectList() {
     }
 
     do {
-        if (match(TokenType::STAR)) {
-            selectList->addChild(std::make_shared<ASTNode>(ASTNodeType::STAR, "*"));
-        } else if (check(TokenType::IDENTIFIER)) {
-            std::string name = parseQualifiedIdentifier();
-            selectList->addChild(std::make_shared<ASTNode>(ASTNodeType::COLUMN_REF, name));
-        }
+        selectList->addChild(parseSelectItem());
     } while (match(TokenType::COMMA));
 
     if (distinct) {
@@ -688,6 +764,25 @@ std::shared_ptr<ASTNode> Parser::parseSelectList() {
     }
 
     return selectList;
+}
+
+std::shared_ptr<ASTNode> Parser::parseSelectItem() {
+    if (match(TokenType::STAR)) {
+        return std::make_shared<ASTNode>(ASTNodeType::STAR, "*");
+    }
+
+    auto expr = parseExpression();
+
+    // Optional alias
+    if (match(TokenType::AS)) {
+        Token aliasTok = consume(TokenType::IDENTIFIER, "Expected alias after AS");
+        expr->alias = aliasTok.lexeme;
+    } else if (check(TokenType::IDENTIFIER)) {
+        // If an identifier follows immediately, treat it as alias
+        expr->alias = advance().lexeme;
+    }
+
+    return expr;
 }
 
 std::shared_ptr<ASTNode> Parser::parseOrderByClause() {
@@ -717,20 +812,79 @@ std::shared_ptr<ASTNode> Parser::parseOrderByClause() {
     return orderBy;
 }
 
+std::shared_ptr<ASTNode> Parser::parseGroupByClause() {
+    auto groupBy = std::make_shared<ASTNode>(ASTNodeType::GROUP_BY);
+    do {
+        std::string column = parseQualifiedIdentifier();
+        groupBy->addChild(std::make_shared<ASTNode>(ASTNodeType::COLUMN_REF, column));
+    } while (match(TokenType::COMMA));
+    return groupBy;
+}
+
+std::shared_ptr<ASTNode> Parser::parseHavingClause() {
+    auto having = std::make_shared<ASTNode>(ASTNodeType::HAVING_CLAUSE);
+    having->addChild(parseExpression());
+    return having;
+}
+
+std::shared_ptr<ASTNode> Parser::parseLimitClause() {
+    auto limitNode = std::make_shared<ASTNode>(ASTNodeType::LIMIT_CLAUSE);
+
+    Token first = consume(TokenType::NUMBER_LITERAL, "Expected numeric LIMIT value");
+    limitNode->addChild(std::make_shared<ASTNode>(ASTNodeType::LITERAL, first.lexeme));
+
+    if (match(TokenType::COMMA)) {
+        Token off = consume(TokenType::NUMBER_LITERAL, "Expected numeric OFFSET value");
+        limitNode->addChild(std::make_shared<ASTNode>(ASTNodeType::LITERAL, off.lexeme));
+    } else if (match(TokenType::OFFSET)) {
+        Token off = consume(TokenType::NUMBER_LITERAL, "Expected numeric OFFSET value");
+        limitNode->addChild(std::make_shared<ASTNode>(ASTNodeType::LITERAL, off.lexeme));
+    }
+
+    return limitNode;
+}
+
 std::shared_ptr<ASTNode> Parser::parseFromClause() {
     auto fromClause = std::make_shared<ASTNode>(ASTNodeType::FROM_CLAUSE);
 
-    if (!check(TokenType::IDENTIFIER)) {
-        throw std::runtime_error("Expected table name");
-    }
+    auto parseTableFactor = [this]() -> std::shared_ptr<ASTNode> {
+        if (match(TokenType::LEFT_PAREN)) {
+            if (!check(TokenType::SELECT)) {
+                throw std::runtime_error("Expected SELECT after '(' in FROM clause");
+            }
+            auto subquery = parseSelectStatement();
+            consume(TokenType::RIGHT_PAREN, "Expected ) after subquery");
 
-    std::string tableName = parseQualifiedIdentifier();
-    fromClause->addChild(std::make_shared<ASTNode>(ASTNodeType::TABLE_REF, tableName));
+            std::string alias;
+            if (match(TokenType::AS)) {
+                alias = consume(TokenType::IDENTIFIER, "Expected alias after AS").lexeme;
+            } else if (check(TokenType::IDENTIFIER)) {
+                alias = advance().lexeme;
+            }
+
+            auto node = std::make_shared<ASTNode>(ASTNodeType::SUBQUERY, "", alias);
+            node->addChild(subquery);
+            return node;
+        }
+
+        Token tableName = consume(TokenType::IDENTIFIER, "Expected table name");
+        std::string alias;
+        if (match(TokenType::AS)) {
+            alias = consume(TokenType::IDENTIFIER, "Expected alias after AS").lexeme;
+        } else if (check(TokenType::IDENTIFIER)) {
+            alias = advance().lexeme;
+        }
+        auto tableNode = std::make_shared<ASTNode>(ASTNodeType::TABLE_REF, tableName.lexeme);
+        tableNode->alias = alias;
+        return tableNode;
+    };
+
+    fromClause->addChild(parseTableFactor());
 
     while (true) {
         if (match(TokenType::COMMA)) {
-            std::string extra = parseQualifiedIdentifier();
-            fromClause->addChild(std::make_shared<ASTNode>(ASTNodeType::TABLE_REF, extra));
+            auto extra = parseTableFactor();
+            fromClause->addChild(extra);
             continue;
         }
 
@@ -750,7 +904,7 @@ std::shared_ptr<ASTNode> Parser::parseFromClause() {
             break;
         }
 
-        std::string joinTable = parseQualifiedIdentifier();
+        auto rightFactor = parseTableFactor();
         auto joinNode = std::make_shared<ASTNode>(ASTNodeType::JOIN_CLAUSE);
         switch (joinToken) {
             case TokenType::LEFT:
@@ -763,7 +917,7 @@ std::shared_ptr<ASTNode> Parser::parseFromClause() {
                 joinNode->value = "INNER";
                 break;
         }
-        joinNode->addChild(std::make_shared<ASTNode>(ASTNodeType::TABLE_REF, joinTable));
+        joinNode->addChild(rightFactor);
         consume(TokenType::ON, "Expected ON after JOIN table");
         joinNode->addChild(parseExpression());
         fromClause->addChild(joinNode);
@@ -867,7 +1021,27 @@ std::shared_ptr<ASTNode> Parser::parsePrimaryExpression() {
     }
 
     if (check(TokenType::IDENTIFIER)) {
-        std::string name = parseQualifiedIdentifier();
+        Token ident = advance();
+        if (match(TokenType::LEFT_PAREN)) {
+            auto func = std::make_shared<ASTNode>(ASTNodeType::FUNCTION_CALL, ident.lexeme);
+            if (!check(TokenType::RIGHT_PAREN)) {
+                do {
+                    if (match(TokenType::STAR)) {
+                        func->addChild(std::make_shared<ASTNode>(ASTNodeType::STAR, "*"));
+                    } else {
+                        func->addChild(parseExpression());
+                    }
+                } while (match(TokenType::COMMA));
+            }
+            consume(TokenType::RIGHT_PAREN, "Expected ) after function arguments");
+            return func;
+        }
+
+        std::string name = ident.lexeme;
+        while (match(TokenType::DOT)) {
+            Token part = consume(TokenType::IDENTIFIER, "Expected identifier after '.'");
+            name += "." + part.lexeme;
+        }
         return std::make_shared<ASTNode>(ASTNodeType::COLUMN_REF, name);
     }
 
@@ -974,11 +1148,14 @@ std::shared_ptr<RelAlgNode> LogicalPlanGenerator::processSelectStatement(
 
     std::shared_ptr<RelAlgNode> plan;
 
-    // Find FROM clause
+    // Find clauses
     std::shared_ptr<ASTNode> fromNode;
     std::shared_ptr<ASTNode> whereNode;
     std::shared_ptr<ASTNode> selectNode;
     std::shared_ptr<ASTNode> orderNode;
+    std::shared_ptr<ASTNode> groupNode;
+    std::shared_ptr<ASTNode> havingNode;
+    std::shared_ptr<ASTNode> limitNode;
 
     for (const auto& child : node->children) {
         if (child->nodeType == ASTNodeType::FROM_CLAUSE) {
@@ -989,6 +1166,12 @@ std::shared_ptr<RelAlgNode> LogicalPlanGenerator::processSelectStatement(
             selectNode = child;
         } else if (child->nodeType == ASTNodeType::ORDER_BY) {
             orderNode = child;
+        } else if (child->nodeType == ASTNodeType::GROUP_BY) {
+            groupNode = child;
+        } else if (child->nodeType == ASTNodeType::HAVING_CLAUSE) {
+            havingNode = child;
+        } else if (child->nodeType == ASTNodeType::LIMIT_CLAUSE) {
+            limitNode = child;
         }
     }
 
@@ -1001,11 +1184,92 @@ std::shared_ptr<RelAlgNode> LogicalPlanGenerator::processSelectStatement(
         plan = processWhereClause(plan, whereNode);
     }
 
-    if (selectNode && plan) {
+    bool distinct = (selectNode && selectNode->value == "DISTINCT");
+
+    auto toUpper = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), ::toupper);
+        return s;
+    };
+    auto isAggregateFunc = [&](const std::string& name) {
+        const std::string upper = toUpper(name);
+        return upper == "SUM" || upper == "COUNT" || upper == "AVG" ||
+               upper == "MIN" || upper == "MAX" || upper == "STDDEV" ||
+               upper == "VARIANCE";
+    };
+
+    bool hasAggregate = false;
+    if (selectNode) {
+        for (const auto& child : selectNode->children) {
+            if (child->nodeType == ASTNodeType::FUNCTION_CALL &&
+                isAggregateFunc(child->value)) {
+                hasAggregate = true;
+                break;
+            }
+        }
+    }
+
+    if ((hasAggregate || groupNode || havingNode) && plan) {
+        std::vector<std::string> groupColumns;
+        if (groupNode) {
+            for (const auto& col : groupNode->children) {
+                if (col->nodeType == ASTNodeType::COLUMN_REF) {
+                    groupColumns.push_back(col->value);
+                }
+            }
+        }
+
+        std::vector<std::string> aggregateSpecs;
+        if (selectNode) {
+            for (const auto& child : selectNode->children) {
+                if (child->nodeType == ASTNodeType::FUNCTION_CALL &&
+                    isAggregateFunc(child->value)) {
+                    std::string arg = "*";
+                    if (!child->children.empty()) {
+                        if (child->children[0]->nodeType == ASTNodeType::STAR) {
+                            arg = "*";
+                        } else {
+                            arg = extractCondition(child->children[0]);
+                        }
+                    }
+                    std::string spec = toUpper(child->value) + "(" + arg + ")";
+                    if (!child->alias.empty()) {
+                        spec += " AS " + child->alias;
+                    }
+                    aggregateSpecs.push_back(spec);
+                } else if (child->nodeType == ASTNodeType::COLUMN_REF &&
+                           !groupNode) {
+                    if (std::find(groupColumns.begin(), groupColumns.end(),
+                                  child->value) == groupColumns.end()) {
+                        groupColumns.push_back(child->value);
+                    }
+                }
+            }
+        }
+
+        // Deduplicate group columns while preserving order
+        std::vector<std::string> deduped;
+        for (const auto& col : groupColumns) {
+            if (std::find(deduped.begin(), deduped.end(), col) == deduped.end()) {
+                deduped.push_back(col);
+            }
+        }
+
+        std::string havingClause;
+        if (havingNode && !havingNode->children.empty()) {
+            havingClause = extractCondition(havingNode->children[0]);
+        }
+
+        auto groupRel = std::make_shared<RelAlgNode>(RelAlgOpType::kGroup,
+            "Group/Aggregate");
+        groupRel->columns = deduped;
+        groupRel->aggregates = aggregateSpecs;
+        groupRel->havingClause = havingClause;
+        groupRel->addChild(plan);
+        plan = groupRel;
+    } else if (selectNode && plan) {
         plan = processSelectList(plan, selectNode);
     }
 
-    bool distinct = (selectNode && selectNode->value == "DISTINCT");
     if (distinct && plan) {
         auto distinctNode = std::make_shared<RelAlgNode>(RelAlgOpType::kDistinct,
             "Distinct output");
@@ -1026,6 +1290,26 @@ std::shared_ptr<RelAlgNode> LogicalPlanGenerator::processSelectStatement(
         plan = sortNode;
     }
 
+    if (limitNode && plan) {
+        std::size_t limitValue = 0;
+        std::size_t offsetValue = 0;
+        if (!limitNode->children.empty()) {
+            limitValue = static_cast<std::size_t>(
+                std::stoull(limitNode->children[0]->value));
+            if (limitNode->children.size() > 1) {
+                offsetValue = static_cast<std::size_t>(
+                    std::stoull(limitNode->children[1]->value));
+            }
+        }
+        auto limitRel = std::make_shared<RelAlgNode>(RelAlgOpType::kLimit,
+            "Limit results");
+        limitRel->limit = limitValue;
+        limitRel->offset = offsetValue;
+        limitRel->hasLimit = true;
+        limitRel->addChild(plan);
+        plan = limitRel;
+    }
+
     return plan;
 }
 
@@ -1034,16 +1318,45 @@ std::shared_ptr<RelAlgNode> LogicalPlanGenerator::processFromClause(
 
     std::shared_ptr<RelAlgNode> current;
 
-    auto makeScan = [](const std::string& table) {
-        auto scan = std::make_shared<RelAlgNode>(RelAlgOpType::kScan,
-            "Scan table " + table);
-        scan->tableName = table;
-        return scan;
+    std::function<std::shared_ptr<RelAlgNode>(std::shared_ptr<ASTNode>)> buildSource;
+    buildSource = [&](std::shared_ptr<ASTNode> ast) -> std::shared_ptr<RelAlgNode> {
+        if (!ast) {
+            return nullptr;
+        }
+        if (ast->nodeType == ASTNodeType::TABLE_REF) {
+            auto scan = std::make_shared<RelAlgNode>(RelAlgOpType::kScan,
+                "Scan table " + ast->value);
+            scan->tableName = ast->value;
+            if (!ast->alias.empty() && ast->alias != ast->value) {
+                auto rename = std::make_shared<RelAlgNode>(RelAlgOpType::kRename,
+                    "Alias " + ast->alias);
+                rename->alias = ast->alias;
+                rename->addChild(scan);
+                return rename;
+            }
+            return scan;
+        }
+        if (ast->nodeType == ASTNodeType::SUBQUERY) {
+            if (ast->children.empty()) {
+                throw std::runtime_error("Subquery missing body");
+            }
+            auto subPlan = processSelectStatement(ast->children[0]);
+            if (!ast->alias.empty()) {
+                auto rename = std::make_shared<RelAlgNode>(RelAlgOpType::kRename,
+                    "Alias " + ast->alias);
+                rename->alias = ast->alias;
+                rename->addChild(subPlan);
+                return rename;
+            }
+            return subPlan;
+        }
+        throw std::runtime_error("Unsupported FROM element");
     };
 
     for (const auto& child : node->children) {
-        if (child->nodeType == ASTNodeType::TABLE_REF) {
-            auto scan = makeScan(child->value);
+        if (child->nodeType == ASTNodeType::TABLE_REF ||
+            child->nodeType == ASTNodeType::SUBQUERY) {
+            auto scan = buildSource(child);
             if (!current) {
                 current = scan;
             } else {
@@ -1057,10 +1370,10 @@ std::shared_ptr<RelAlgNode> LogicalPlanGenerator::processFromClause(
             if (!current) {
                 throw std::runtime_error("JOIN clause without left input");
             }
-            if (child->children.empty() || child->children[0]->nodeType != ASTNodeType::TABLE_REF) {
+            if (child->children.empty()) {
                 throw std::runtime_error("JOIN clause missing right table");
             }
-            auto rightScan = makeScan(child->children[0]->value);
+            auto rightScan = buildSource(child->children[0]);
             std::string cond;
             if (child->children.size() > 1) {
                 cond = extractCondition(child->children[1]);
@@ -1113,6 +1426,8 @@ std::shared_ptr<RelAlgNode> LogicalPlanGenerator::processSelectList(
             hasStar = true;
         } else if (child->nodeType == ASTNodeType::COLUMN_REF) {
             columns.push_back(child->value);
+        } else {
+            throw std::runtime_error("Only simple column selections are supported without GROUP BY");
         }
     }
 
@@ -1316,6 +1631,44 @@ std::shared_ptr<PhysicalPlanNode> PhysicalPlanGenerator::convertNode(
             physNode->algorithm = "In-memory sort";
             physNode->planFlow = "materialized";
             break;
+        case RelAlgOpType::kGroup: {
+            physNode = std::make_shared<PhysicalPlanNode>(PhysicalOpType::kAggregate,
+                "Group/Aggregate");
+            if (!node->columns.empty()) {
+                std::string group;
+                for (std::size_t i = 0; i < node->columns.size(); ++i) {
+                    if (i > 0) group += ",";
+                    group += node->columns[i];
+                }
+                physNode->parameters["group_by"] = group;
+            }
+            if (!node->aggregates.empty()) {
+                std::string aggs;
+                for (std::size_t i = 0; i < node->aggregates.size(); ++i) {
+                    if (i > 0) aggs += ",";
+                    aggs += node->aggregates[i];
+                }
+                physNode->parameters["aggregates"] = aggs;
+            }
+            if (!node->havingClause.empty()) {
+                physNode->parameters["having"] = node->havingClause;
+            }
+            physNode->planFlow = "materialized";
+            break;
+        }
+        case RelAlgOpType::kLimit:
+            physNode = std::make_shared<PhysicalPlanNode>(PhysicalOpType::kLimit,
+                "Limit results");
+            physNode->parameters["limit"] = std::to_string(node->limit);
+            physNode->parameters["offset"] = std::to_string(node->offset);
+            physNode->planFlow = "pipeline";
+            break;
+        case RelAlgOpType::kRename:
+            physNode = std::make_shared<PhysicalPlanNode>(PhysicalOpType::kAlias,
+                "Apply alias");
+            physNode->parameters["alias"] = node->alias;
+            physNode->planFlow = "pipeline";
+            break;
 
         default:
             physNode = std::make_shared<PhysicalPlanNode>(PhysicalOpType::kTableScan,
@@ -1434,7 +1787,9 @@ int PhysicalPlanGenerator::estimateCost(std::shared_ptr<PhysicalPlanNode> node) 
         case PhysicalOpType::kDistinct:
             cost = 1; // Pipeline operations are cheap
             break;
-
+        case PhysicalOpType::kAggregate:
+            cost = 120;
+            break;
         case PhysicalOpType::kNestedLoopJoin:
             cost = 1000; // Joins are expensive
             break;
@@ -1444,6 +1799,10 @@ int PhysicalPlanGenerator::estimateCost(std::shared_ptr<PhysicalPlanNode> node) 
             break;
         case PhysicalOpType::kSort:
             cost = 150;
+            break;
+        case PhysicalOpType::kLimit:
+        case PhysicalOpType::kAlias:
+            cost = 1;
             break;
 
         default:

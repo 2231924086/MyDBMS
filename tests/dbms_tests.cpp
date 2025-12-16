@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -25,6 +26,10 @@ void require(bool condition, const std::string &message) {
     if (!condition) {
         throw std::runtime_error(message);
     }
+}
+
+bool approxEqual(double a, double b, double epsilon = 1e-6) {
+    return std::abs(a - b) <= epsilon;
 }
 
 void removeIfExists(const fs::path &path) {
@@ -759,6 +764,34 @@ void testSqlDistinctAndOrderBy() {
             "distinct + order by should return 3,2,1");
 }
 
+void testSqlLimitOffset() {
+    const fs::path tempRoot = fs::current_path() / "tmp_dbms_tests" / "sql_limit_offset";
+    removeIfExists(tempRoot);
+    WorkingDirGuard guard(tempRoot);
+    removeIfExists("storage");
+
+    const std::size_t blockSizeBytes = 512;
+    const std::size_t mainMemoryBytes = 2 * 1024 * 1024;
+    const std::size_t diskBytes = 8 * 1024 * 1024;
+    DatabaseSystem db(blockSizeBytes, mainMemoryBytes, diskBytes);
+
+    TableSchema nums("numbers", {{"value", ColumnType::Integer, 8}});
+    db.registerTable(nums);
+    db.insertRecord("numbers", Record{"1"});
+    db.insertRecord("numbers", Record{"2"});
+    db.insertRecord("numbers", Record{"3"});
+    db.insertRecord("numbers", Record{"4"});
+
+    auto result = runSql(db, "SELECT value FROM numbers ORDER BY value LIMIT 2 OFFSET 1");
+    require(result.size() == 2, "limit+offset should return two rows");
+    std::vector<std::string> values;
+    for (const auto &row : result) {
+        values.push_back(row.getValue("value"));
+    }
+    require((values == std::vector<std::string>{"2", "3"}),
+            "limit+offset should skip first row and take next two");
+}
+
 void testLeftAndRightJoinSupport() {
     const fs::path tempRoot = fs::current_path() / "tmp_dbms_tests" / "sql_join_types";
     removeIfExists(tempRoot);
@@ -826,6 +859,46 @@ void testLeftAndRightJoinSupport() {
             "right join should output all purchase user_ids");
     require((purchaserNames == std::vector<std::string>{"Alice", "Bob", "NULL"}),
             "right join should set NULL when no matching user exists");
+}
+
+void testSubqueryInFrom() {
+    const fs::path tempRoot = fs::current_path() / "tmp_dbms_tests" / "sql_subquery_from";
+    removeIfExists(tempRoot);
+    WorkingDirGuard guard(tempRoot);
+    removeIfExists("storage");
+
+    const std::size_t blockSizeBytes = 512;
+    const std::size_t mainMemoryBytes = 2 * 1024 * 1024; // 2 MiB
+    const std::size_t diskBytes = 8 * 1024 * 1024;       // 8 MiB
+    DatabaseSystem db(blockSizeBytes, mainMemoryBytes, diskBytes);
+
+    TableSchema users(
+        "users",
+        {
+            {"id", ColumnType::Integer, 16},
+            {"name", ColumnType::String, 32},
+            {"age", ColumnType::Integer, 8},
+        });
+    db.registerTable(users);
+
+    db.insertRecord("users", Record{"1", "Alice", "30"});
+    db.insertRecord("users", Record{"2", "Bob", "42"});
+    db.insertRecord("users", Record{"3", "Carol", "28"});
+    db.insertRecord("users", Record{"4", "Dave", "55"});
+
+    auto result = runSql(
+        db,
+        "SELECT sub.name "
+        "FROM (SELECT name, age FROM users WHERE age >= 40) AS sub "
+        "ORDER BY sub.name");
+
+    require(result.size() == 2, "subquery in FROM should return two rows");
+    std::vector<std::string> names;
+    for (const auto &row : result) {
+        names.push_back(row.getValue("name"));
+    }
+    require((names == std::vector<std::string>{"Bob", "Dave"}),
+            "subquery should filter and expose alias-qualified columns");
 }
 
 void testSqlUpdateExecution() {
@@ -946,6 +1019,32 @@ void testSortOperatorOrdersResults() {
             "ages should be ordered descending");
 }
 
+void testAggregateStddevVariance() {
+    const fs::path tempRoot = fs::current_path() / "tmp_dbms_tests" / "aggregate_stddev";
+    removeIfExists(tempRoot);
+    WorkingDirGuard guard(tempRoot);
+    removeIfExists("storage");
+
+    const std::size_t blockSizeBytes = 512;
+    const std::size_t mainMemoryBytes = 2 * 1024 * 1024;
+    const std::size_t diskBytes = 8 * 1024 * 1024;
+    DatabaseSystem db(blockSizeBytes, mainMemoryBytes, diskBytes);
+
+    TableSchema metrics("metrics", {{"val", ColumnType::Integer, 8}});
+    db.registerTable(metrics);
+    db.insertRecord("metrics", Record{"10"});
+    db.insertRecord("metrics", Record{"20"});
+    db.insertRecord("metrics", Record{"30"});
+
+    auto result = runSql(db, "SELECT VARIANCE(val), STDDEV(val) FROM metrics");
+    require(result.size() == 1, "variance/stddev aggregate should return a single row");
+    const auto &row = result.getTuple(0);
+    double variance = std::stod(row.getValue("VARIANCE(val)"));
+    double stddev = std::stod(row.getValue("STDDEV(val)"));
+    require(approxEqual(variance, 66.666666, 1e-3), "variance should match expected value");
+    require(approxEqual(stddev, 8.164965, 1e-3), "stddev should match expected value");
+}
+
 void testAggregateGroupByHaving() {
     const fs::path tempRoot = fs::current_path() / "tmp_dbms_tests" / "aggregate_operator";
     removeIfExists(tempRoot);
@@ -1009,10 +1108,13 @@ int main() {
     runner.run("Corrupted data block is detected", testCorruptedDataFileDetection);
     runner.run("Corrupted index file triggers rebuild", testCorruptedIndexFileRebuild);
     runner.run("SQL DISTINCT with ORDER BY", testSqlDistinctAndOrderBy);
+    runner.run("SQL LIMIT/OFFSET clauses", testSqlLimitOffset);
     runner.run("LEFT/RIGHT join execution", testLeftAndRightJoinSupport);
+    runner.run("Subquery in FROM clause", testSubqueryInFrom);
     runner.run("SQL UPDATE applies SET with WHERE", testSqlUpdateExecution);
     runner.run("SQL DELETE removes matching rows", testSqlDeleteExecution);
     runner.run("Sort operator orders tuples", testSortOperatorOrdersResults);
+    runner.run("Aggregate stddev/variance", testAggregateStddevVariance);
     runner.run("Aggregate operator group by + having", testAggregateGroupByHaving);
     return runner.summary() == 0 ? 0 : 1;
 }

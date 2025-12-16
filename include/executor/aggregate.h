@@ -13,7 +13,7 @@ namespace dbms {
 
 class AggregateOperator : public Operator {
 public:
-    enum class AggFunc { SUM, COUNT, AVG, MIN, MAX };
+    enum class AggFunc { SUM, COUNT, AVG, MIN, MAX, STDDEV, VARIANCE };
 
     struct AggregateSpec {
         AggFunc func;
@@ -44,6 +44,7 @@ private:
     struct AggregateAccumulator {
         int64_t intSum{0};
         double doubleSum{0.0};
+        double doubleSumSquares{0.0};
         int64_t count{0};
         ExprValue extreme;
         bool hasValue{false};
@@ -85,4 +86,3 @@ private:
 };
 
 } // namespace dbms
-

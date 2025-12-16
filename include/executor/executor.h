@@ -46,6 +46,12 @@ private:
     std::unique_ptr<Operator> buildAggregate(
         std::shared_ptr<PhysicalPlanNode> planNode,
         std::unique_ptr<Operator> child);
+    std::unique_ptr<Operator> buildLimit(
+        std::shared_ptr<PhysicalPlanNode> planNode,
+        std::unique_ptr<Operator> child);
+    std::unique_ptr<Operator> buildAlias(
+        std::shared_ptr<PhysicalPlanNode> planNode,
+        std::unique_ptr<Operator> child);
 
     // Helper: parse expression from string
     std::unique_ptr<Expression> parseExpression(const std::string& exprStr);

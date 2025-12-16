@@ -7,6 +7,8 @@
 #include "executor/join.h"
 #include "executor/projection.h"
 #include "executor/distinct.h"
+#include "executor/limit.h"
+#include "executor/alias.h"
 #include "executor/sort.h"
 #include "executor/table_scan.h"
 
@@ -97,6 +99,12 @@ dbms::AggregateOperator::AggFunc parseAggFunc(const std::string& func) {
     if (upper == "AVG") return dbms::AggregateOperator::AggFunc::AVG;
     if (upper == "MIN") return dbms::AggregateOperator::AggFunc::MIN;
     if (upper == "MAX") return dbms::AggregateOperator::AggFunc::MAX;
+    if (upper == "STDDEV" || upper == "STDDEV_POP" || upper == "STDDEV_SAMP") {
+        return dbms::AggregateOperator::AggFunc::STDDEV;
+    }
+    if (upper == "VARIANCE" || upper == "VAR" || upper == "VAR_POP" || upper == "VAR_SAMP") {
+        return dbms::AggregateOperator::AggFunc::VARIANCE;
+    }
     throw std::runtime_error("unknown aggregate function: " + func);
 }
 
@@ -271,6 +279,16 @@ std::unique_ptr<Operator> QueryExecutor::buildOperatorTree(std::shared_ptr<Physi
                 throw std::runtime_error("AGGREGATE node has no child");
             }
             return buildAggregate(planNode, buildOperatorTree(planNode->children[0]));
+        case PhysicalOpType::kLimit:
+            if (planNode->children.empty()) {
+                throw std::runtime_error("LIMIT node has no child");
+            }
+            return buildLimit(planNode, buildOperatorTree(planNode->children[0]));
+        case PhysicalOpType::kAlias:
+            if (planNode->children.empty()) {
+                throw std::runtime_error("ALIAS node has no child");
+            }
+            return buildAlias(planNode, buildOperatorTree(planNode->children[0]));
 
         default:
             throw std::runtime_error("unsupported physical operator type");
@@ -478,6 +496,30 @@ std::unique_ptr<Operator> QueryExecutor::buildAggregate(
                                                std::move(groupBy),
                                                std::move(aggregates),
                                                havingClause);
+}
+
+std::unique_ptr<Operator> QueryExecutor::buildLimit(
+    std::shared_ptr<PhysicalPlanNode> planNode,
+    std::unique_ptr<Operator> child) {
+    std::size_t limit = 0;
+    std::size_t offset = 0;
+    auto itLimit = planNode->parameters.find("limit");
+    if (itLimit != planNode->parameters.end()) {
+        limit = static_cast<std::size_t>(std::stoull(itLimit->second));
+    }
+    auto itOffset = planNode->parameters.find("offset");
+    if (itOffset != planNode->parameters.end()) {
+        offset = static_cast<std::size_t>(std::stoull(itOffset->second));
+    }
+    return std::make_unique<LimitOperator>(std::move(child), limit, offset);
+}
+
+std::unique_ptr<Operator> QueryExecutor::buildAlias(
+    std::shared_ptr<PhysicalPlanNode> planNode,
+    std::unique_ptr<Operator> child) {
+    auto it = planNode->parameters.find("alias");
+    std::string alias = (it != planNode->parameters.end()) ? it->second : "";
+    return std::make_unique<AliasOperator>(std::move(child), alias);
 }
 
 std::unique_ptr<Expression> QueryExecutor::parseExpression(const std::string& exprStr) {
