@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include "index/index_manager.h"
 #include "storage/buffer_pool.h"
 #include "storage/disk_manager.h"
+#include "storage/write_ahead_log.h"
 #include "system/catalog.h"
 #include "system/table.h"
 #include "parser/query_processor.h"
@@ -51,6 +53,12 @@ namespace dbms {
             std::optional<Record> after;
         };
 
+        struct WalContext {
+            std::size_t txnId{0};
+            bool implicit{false};
+            bool active{false};
+        };
+
     public:
         struct TableDumpRow {
             std::size_t blockIndex{0};
@@ -81,6 +89,7 @@ namespace dbms {
                      planCacheFilePath(storagePath_)),
           logBuffer_(static_cast<std::size_t>(mainMemoryBytes * 0.10),
                      logFilePath(storagePath_)),
+          wal_(walFilePath(storagePath_)),
           indexCatalogFile_(indexCatalogFilePath(storagePath_)),
           rng_(std::random_device{}()) {
         if (blockSize_ == 0) {
@@ -91,6 +100,24 @@ namespace dbms {
         }
         computePartitions();
         loadIndexCatalogFromDisk();
+        pendingWalEntries_ = wal_.load();
+        std::size_t maxWalTxn = 0;
+        for (const auto &entry : pendingWalEntries_) {
+            if (entry.type == WriteAheadLog::EntryType::Insert ||
+                entry.type == WriteAheadLog::EntryType::Delete ||
+                entry.type == WriteAheadLog::EntryType::Update) {
+                walTables_.insert(entry.address.table);
+            }
+            if (entry.txnId > maxWalTxn) {
+                maxWalTxn = entry.txnId;
+            }
+        }
+        if (maxWalTxn >= nextTxnId_) {
+            nextTxnId_ = maxWalTxn + 1;
+        }
+        if (pendingWalEntries_.empty()) {
+            recoveryPerformed_ = true;
+        }
     }
 
         void executeSQL(const std::string &sql) {
@@ -124,6 +151,7 @@ namespace dbms {
                                      it->second.totalRecords(),
                                      it->second.blockCount());
         restoreIndexesForTable(schema.name());
+        recoverFromWalIfNeeded();
     }
 
 
@@ -167,8 +195,12 @@ namespace dbms {
             if (transactionActive_) {
                 throw std::runtime_error("transaction already in progress");
             }
+            currentTxnId_ = nextTxnId_++;
             transactionActive_ = true;
             undoLog_.clear();
+            if (!suppressWal_) {
+                wal_.logBegin(*currentTxnId_);
+            }
             logBuffer_.append("begin");
         }
 
@@ -177,7 +209,11 @@ namespace dbms {
                 throw std::runtime_error("no active transaction to commit");
             }
             undoLog_.clear();
+            if (!suppressWal_ && currentTxnId_.has_value()) {
+                wal_.logCommit(*currentTxnId_);
+            }
             transactionActive_ = false;
+            currentTxnId_.reset();
             logBuffer_.append("commit");
             logBuffer_.flushToDisk();
             buffer_.flush();
@@ -187,15 +223,20 @@ namespace dbms {
             if (!transactionActive_) {
                 throw std::runtime_error("no active transaction to rollback");
             }
+            if (!suppressWal_ && currentTxnId_.has_value()) {
+                wal_.logRollback(*currentTxnId_);
+            }
             {
                 ScopedFlagGuard undoGuard(suppressUndo_, true);
                 ScopedFlagGuard applyingGuard(applyingUndo_, true);
+                ScopedFlagGuard walGuard(suppressWal_, true);
                 for (auto it = undoLog_.rbegin(); it != undoLog_.rend(); ++it) {
                     applyUndo(*it);
                 }
             }
             undoLog_.clear();
             transactionActive_ = false;
+            currentTxnId_.reset();
             logBuffer_.append("rollback");
             logBuffer_.flushToDisk();
             buffer_.flush();
@@ -203,74 +244,86 @@ namespace dbms {
 
 
     void insertRecord(const std::string &tableName, Record record) {
-        auto &table = getTable(tableName);
-        ensureRecordFits(table.schema(), record);
-        enforceUniqueKeys(tableName, record, nullptr, std::nullopt);
-        const std::size_t footprint =
-            VariableLengthPage::estimatePayload(record) +
-            VariableLengthPage::kSlotOverheadBytes;
-        if (footprint > blockSize_) {
-            std::ostringstream oss;
-            oss << "record does not fit into a single block (requires "
-                << footprint << " bytes, block size is " << blockSize_ << ")";
-            throw std::runtime_error(oss.str());
-        }
-        if (table.blocks().empty()) {
-            auto addr = disk_.allocateBlock(tableName);
-            table.addBlock(addr);
-        }
-
-        auto fetchResult = buffer_.fetch(table.lastBlock(), true);
-        fetchResult.block.ensureInitialized(blockSize_);
-        Block *targetBlock = &fetchResult.block;
-        if (!targetBlock->hasSpaceFor(record)) {
-            auto addr = disk_.allocateBlock(tableName);
-            table.addBlock(addr);
-            auto newFetch = buffer_.fetch(addr, true);
-            newFetch.block.ensureInitialized(blockSize_);
-            targetBlock = &newFetch.block;
-            if (!targetBlock->hasSpaceFor(record)) {
+        auto walCtx = startWalContext();
+        bool walSuccess = false;
+        try {
+            auto &table = getTable(tableName);
+            ensureRecordFits(table.schema(), record);
+            enforceUniqueKeys(tableName, record, nullptr, std::nullopt);
+            const std::size_t footprint =
+                VariableLengthPage::estimatePayload(record) +
+                VariableLengthPage::kSlotOverheadBytes;
+            if (footprint > blockSize_) {
                 std::ostringstream oss;
-                oss << "record cannot be placed even in an empty block for "
-                    << tableName;
+                oss << "record does not fit into a single block (requires "
+                    << footprint << " bytes, block size is " << blockSize_ << ")";
                 throw std::runtime_error(oss.str());
             }
-        }
-        auto slotId = targetBlock->insertRecord(std::move(record));
-        if (!slotId.has_value()) {
-            std::ostringstream oss;
-            oss << "failed to insert record into block " << targetBlock->address.table
-                << "#" << targetBlock->address.index;
-            throw std::runtime_error(oss.str());
-        }
-        const Record *stored = targetBlock->getRecord(*slotId);
-        if (stored) {
-            try {
-                applyIndexInsert(tableName, *stored, targetBlock->address, *slotId);
-            } catch (...) {
-                targetBlock->eraseRecord(*slotId);
-                throw;
+            if (table.blocks().empty()) {
+                auto addr = disk_.allocateBlock(tableName);
+                table.addBlock(addr);
             }
-        }
-        table.incrementRecords();
-        dictionary_.updateTableStats(tableName,
-                                     table.totalRecords(),
-                                     table.blockCount());
-        if (transactionActive_ && !suppressUndo_) {
-            UndoEntry entry;
-            entry.type = UndoType::Insert;
-            entry.address = targetBlock->address;
-            entry.slot = *slotId;
+
+            auto fetchResult = buffer_.fetch(table.lastBlock(), true);
+            fetchResult.block.ensureInitialized(blockSize_);
+            Block *targetBlock = &fetchResult.block;
+            if (!targetBlock->hasSpaceFor(record)) {
+                auto addr = disk_.allocateBlock(tableName);
+                table.addBlock(addr);
+                auto newFetch = buffer_.fetch(addr, true);
+                newFetch.block.ensureInitialized(blockSize_);
+                targetBlock = &newFetch.block;
+                if (!targetBlock->hasSpaceFor(record)) {
+                    std::ostringstream oss;
+                    oss << "record cannot be placed even in an empty block for "
+                        << tableName;
+                    throw std::runtime_error(oss.str());
+                }
+            }
+            auto slotId = targetBlock->insertRecord(std::move(record));
+            if (!slotId.has_value()) {
+                std::ostringstream oss;
+                oss << "failed to insert record into block " << targetBlock->address.table
+                    << "#" << targetBlock->address.index;
+                throw std::runtime_error(oss.str());
+            }
+            const Record *stored = targetBlock->getRecord(*slotId);
             if (stored) {
-                entry.after = *stored;
+                try {
+                    applyIndexInsert(tableName, *stored, targetBlock->address, *slotId);
+                } catch (...) {
+                    targetBlock->eraseRecord(*slotId);
+                    throw;
+                }
             }
-            undoLog_.push_back(std::move(entry));
+            table.incrementRecords();
+            dictionary_.updateTableStats(tableName,
+                                         table.totalRecords(),
+                                         table.blockCount());
+            if (transactionActive_ && !suppressUndo_) {
+                UndoEntry entry;
+                entry.type = UndoType::Insert;
+                entry.address = targetBlock->address;
+                entry.slot = *slotId;
+                if (stored) {
+                    entry.after = *stored;
+                }
+                undoLog_.push_back(std::move(entry));
+            }
+            if (!applyingUndo_) {
+                planCache_.recordPlan("INSERT INTO " + tableName);
+                logBuffer_.append("insert into " + tableName);
+            }
+            if (walCtx.active && !suppressWal_ && stored) {
+                wal_.logInsert(walCtx.txnId, targetBlock->address, *slotId, *stored);
+            }
+            persistIndexesForTable(tableName);
+            walSuccess = true;
+        } catch (...) {
+            finishWalContext(walCtx, false);
+            throw;
         }
-        if (!applyingUndo_) {
-            planCache_.recordPlan("INSERT INTO " + tableName);
-            logBuffer_.append("insert into " + tableName);
-        }
-        persistIndexesForTable(tableName);
+        finishWalContext(walCtx, walSuccess);
     }
 
         std::optional<Record> readRecord(const BlockAddress &addr,
@@ -290,78 +343,104 @@ namespace dbms {
     bool updateRecord(const BlockAddress &addr,
                       std::size_t slotIndex,
                       Record record) {
-        auto &table = getTable(addr.table);
-        ensureRecordFits(table.schema(), record);
-        enforceUniqueKeys(addr.table, record, &addr, slotIndex);
-        const std::size_t footprint =
-            VariableLengthPage::estimatePayload(record) +
-            VariableLengthPage::kSlotOverheadBytes;
-        if (footprint > blockSize_) {
-            std::ostringstream oss;
+        auto walCtx = startWalContext();
+        bool walSuccess = false;
+        bool success = false;
+        try {
+            auto &table = getTable(addr.table);
+            ensureRecordFits(table.schema(), record);
+            enforceUniqueKeys(addr.table, record, &addr, slotIndex);
+            const std::size_t footprint =
+                VariableLengthPage::estimatePayload(record) +
+                VariableLengthPage::kSlotOverheadBytes;
+            if (footprint > blockSize_) {
+                std::ostringstream oss;
                 oss << "updated record exceeds block capacity (requires "
                     << footprint << " bytes, block size " << blockSize_ << ")";
                 throw std::runtime_error(oss.str());
             }
-        auto fetchResult = buffer_.fetch(addr, true);
-        fetchResult.block.ensureInitialized(blockSize_);
-        const Record *beforePtr = fetchResult.block.getRecord(slotIndex);
-        if (!beforePtr) {
-            return false;
-        }
-        Record before = *beforePtr;
-        Record newRecordCopy = record;
-        const bool success =
-            fetchResult.block.updateRecord(slotIndex, std::move(record));
-        if (success) {
-            applyIndexUpdate(addr.table, before, newRecordCopy, addr, slotIndex);
-            if (transactionActive_ && !suppressUndo_) {
-                UndoEntry entry;
-                entry.type = UndoType::Update;
-                entry.address = addr;
-                entry.slot = slotIndex;
-                entry.before = before;
-                undoLog_.push_back(std::move(entry));
+            auto fetchResult = buffer_.fetch(addr, true);
+            fetchResult.block.ensureInitialized(blockSize_);
+            const Record *beforePtr = fetchResult.block.getRecord(slotIndex);
+            if (!beforePtr) {
+                success = false;
+            } else {
+                Record before = *beforePtr;
+                Record newRecordCopy = record;
+                success = fetchResult.block.updateRecord(slotIndex, std::move(record));
+                if (success) {
+                    applyIndexUpdate(addr.table, before, newRecordCopy, addr, slotIndex);
+                    if (transactionActive_ && !suppressUndo_) {
+                        UndoEntry entry;
+                        entry.type = UndoType::Update;
+                        entry.address = addr;
+                        entry.slot = slotIndex;
+                        entry.before = before;
+                        undoLog_.push_back(std::move(entry));
+                    }
+                    if (!applyingUndo_) {
+                        planCache_.recordPlan("UPDATE " + addr.table);
+                        logBuffer_.append("update " + addr.table);
+                    }
+                    if (walCtx.active && !suppressWal_) {
+                        wal_.logUpdate(walCtx.txnId, addr, slotIndex, before, newRecordCopy);
+                    }
+                    persistIndexesForTable(addr.table);
+                    walSuccess = true;
+                }
             }
-            if (!applyingUndo_) {
-                planCache_.recordPlan("UPDATE " + addr.table);
-                logBuffer_.append("update " + addr.table);
-            }
-            persistIndexesForTable(addr.table);
+        } catch (...) {
+            finishWalContext(walCtx, false);
+            throw;
         }
+        finishWalContext(walCtx, walSuccess);
         return success;
     }
 
     bool deleteRecord(const BlockAddress &addr, std::size_t slotIndex) {
-        auto &table = getTable(addr.table);
-        auto fetchResult = buffer_.fetch(addr, true);
-        fetchResult.block.ensureInitialized(blockSize_);
-        std::optional<Record> before;
-        if (const Record *recordPtr = fetchResult.block.getRecord(slotIndex)) {
-            before = *recordPtr;
-        }
-        const bool success = fetchResult.block.eraseRecord(slotIndex);
-        if (success) {
-            if (before.has_value()) {
-                applyIndexDelete(addr.table, *before);
-                if (transactionActive_ && !suppressUndo_) {
-                    UndoEntry entry;
-                    entry.type = UndoType::Delete;
-                    entry.address = addr;
-                    entry.slot = slotIndex;
-                    entry.before = *before;
-                    undoLog_.push_back(std::move(entry));
+        auto walCtx = startWalContext();
+        bool walSuccess = false;
+        bool success = false;
+        try {
+            auto &table = getTable(addr.table);
+            auto fetchResult = buffer_.fetch(addr, true);
+            fetchResult.block.ensureInitialized(blockSize_);
+            std::optional<Record> before;
+            if (const Record *recordPtr = fetchResult.block.getRecord(slotIndex)) {
+                before = *recordPtr;
+            }
+            success = fetchResult.block.eraseRecord(slotIndex);
+            if (success) {
+                if (before.has_value()) {
+                    applyIndexDelete(addr.table, *before);
+                    if (transactionActive_ && !suppressUndo_) {
+                        UndoEntry entry;
+                        entry.type = UndoType::Delete;
+                        entry.address = addr;
+                        entry.slot = slotIndex;
+                        entry.before = *before;
+                        undoLog_.push_back(std::move(entry));
+                    }
+                    if (walCtx.active && !suppressWal_) {
+                        wal_.logDelete(walCtx.txnId, addr, slotIndex, *before);
+                    }
                 }
+                table.decrementRecords();
+                dictionary_.updateTableStats(addr.table,
+                                             table.totalRecords(),
+                                             table.blockCount());
+                if (!applyingUndo_) {
+                    planCache_.recordPlan("DELETE FROM " + addr.table);
+                    logBuffer_.append("delete from " + addr.table);
+                }
+                persistIndexesForTable(addr.table);
+                walSuccess = true;
             }
-            table.decrementRecords();
-            dictionary_.updateTableStats(addr.table,
-                                         table.totalRecords(),
-                                         table.blockCount());
-            if (!applyingUndo_) {
-                planCache_.recordPlan("DELETE FROM " + addr.table);
-                logBuffer_.append("delete from " + addr.table);
-            }
-            persistIndexesForTable(addr.table);
+        } catch (...) {
+            finishWalContext(walCtx, false);
+            throw;
         }
+        finishWalContext(walCtx, walSuccess);
         return success;
     }
 
@@ -644,6 +723,219 @@ namespace dbms {
         }
 
     private:
+        WalContext startWalContext() {
+            WalContext ctx;
+            if (suppressWal_) {
+                return ctx;
+            }
+            if (transactionActive_) {
+                if (!currentTxnId_.has_value()) {
+                    currentTxnId_ = nextTxnId_++;
+                    wal_.logBegin(*currentTxnId_);
+                }
+                ctx.txnId = *currentTxnId_;
+                ctx.implicit = false;
+                ctx.active = true;
+            } else {
+                ctx.txnId = nextTxnId_++;
+                ctx.implicit = true;
+                ctx.active = true;
+                wal_.logBegin(ctx.txnId);
+            }
+            return ctx;
+        }
+
+        void finishWalContext(const WalContext &ctx, bool success) {
+            if (suppressWal_ || !ctx.active || !ctx.implicit) {
+                return;
+            }
+            if (success) {
+                wal_.logCommit(ctx.txnId);
+            } else {
+                wal_.logRollback(ctx.txnId);
+            }
+        }
+
+        bool isWalDataEntry(const WriteAheadLog::Entry &entry) const {
+            return entry.type == WriteAheadLog::EntryType::Insert ||
+                   entry.type == WriteAheadLog::EntryType::Delete ||
+                   entry.type == WriteAheadLog::EntryType::Update;
+        }
+
+        bool allWalTablesRegistered() const {
+            for (const auto &name : walTables_) {
+                if (tables_.find(name) == tables_.end()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        void recoverFromWalIfNeeded() {
+            if (recoveryPerformed_) {
+                return;
+            }
+            if (pendingWalEntries_.empty()) {
+                wal_.clear();
+                recoveryPerformed_ = true;
+                return;
+            }
+            if (!allWalTablesRegistered()) {
+                return;
+            }
+            performCrashRecovery();
+        }
+
+        void performCrashRecovery() {
+            std::unordered_map<std::size_t, bool> committed;
+            for (const auto &entry : pendingWalEntries_) {
+                if (entry.type == WriteAheadLog::EntryType::Begin) {
+                    committed.emplace(entry.txnId, false);
+                } else if (entry.type == WriteAheadLog::EntryType::Commit) {
+                    committed[entry.txnId] = true;
+                } else if (entry.type == WriteAheadLog::EntryType::Rollback) {
+                    committed[entry.txnId] = false;
+                }
+            }
+
+            ScopedFlagGuard undoGuard(suppressUndo_, true);
+            ScopedFlagGuard applyingGuard(applyingUndo_, true);
+            ScopedFlagGuard walGuard(suppressWal_, true);
+
+            for (const auto &entry : pendingWalEntries_) {
+                if (isWalDataEntry(entry) && committed[entry.txnId]) {
+                    applyWalRedo(entry);
+                }
+            }
+            for (auto it = pendingWalEntries_.rbegin(); it != pendingWalEntries_.rend(); ++it) {
+                if (isWalDataEntry(*it) && !committed[it->txnId]) {
+                    applyWalUndo(*it);
+                }
+            }
+            buffer_.flush();
+            for (const auto &binding : indexesByTable_) {
+                for (const auto &indexName : binding.second) {
+                    persistIndex(indexName);
+                }
+            }
+            wal_.clear();
+            pendingWalEntries_.clear();
+            walTables_.clear();
+            recoveryPerformed_ = true;
+        }
+
+        void applyWalRedo(const WriteAheadLog::Entry &entry) {
+            try {
+                switch (entry.type) {
+                case WriteAheadLog::EntryType::Insert: {
+                    if (!entry.after.has_value()) {
+                        return;
+                    }
+                    BlockAddress addrFound;
+                    std::size_t slotFound{0};
+                    if (findRecord(entry.address.table, *entry.after, addrFound, slotFound)) {
+                        return;
+                    }
+                    insertRecord(entry.address.table, *entry.after);
+                    break;
+                }
+                case WriteAheadLog::EntryType::Delete: {
+                    if (!entry.before.has_value()) {
+                        return;
+                    }
+                    BlockAddress addrFound;
+                    std::size_t slotFound{0};
+                    if (findRecord(entry.address.table, *entry.before, addrFound, slotFound)) {
+                        deleteRecord(addrFound, slotFound);
+                    }
+                    break;
+                }
+                case WriteAheadLog::EntryType::Update: {
+                    if (!entry.after.has_value()) {
+                        return;
+                    }
+                    BlockAddress addrFound = entry.address;
+                    std::size_t slotFound = entry.slot;
+                    bool located = false;
+                    if (entry.before.has_value()) {
+                        located = findRecord(entry.address.table, *entry.before, addrFound, slotFound);
+                    }
+                    if (!located) {
+                        if (disk_.contains(entry.address)) {
+                            auto fetch = buffer_.fetch(entry.address, false);
+                            fetch.block.ensureInitialized(blockSize_);
+                            if (fetch.block.getRecord(entry.slot)) {
+                                located = true;
+                                addrFound = entry.address;
+                                slotFound = entry.slot;
+                            }
+                        }
+                    }
+                    if (located) {
+                        if (!updateRecord(addrFound, slotFound, *entry.after)) {
+                            insertRecord(entry.address.table, *entry.after);
+                        }
+                    } else {
+                        insertRecord(entry.address.table, *entry.after);
+                    }
+                    break;
+                }
+                default:
+                    break;
+                }
+            } catch (const std::exception &ex) {
+                std::cerr << "WAL redo skipped entry: " << ex.what() << "\n";
+            }
+        }
+
+        void applyWalUndo(const WriteAheadLog::Entry &entry) {
+            UndoEntry undo;
+            switch (entry.type) {
+            case WriteAheadLog::EntryType::Insert:
+                undo.type = UndoType::Insert;
+                undo.address = entry.address;
+                undo.slot = entry.slot;
+                undo.after = entry.after;
+                break;
+            case WriteAheadLog::EntryType::Delete:
+                undo.type = UndoType::Delete;
+                undo.address = entry.address;
+                undo.slot = entry.slot;
+                undo.before = entry.before;
+                break;
+            case WriteAheadLog::EntryType::Update:
+                undo.type = UndoType::Update;
+                undo.address = entry.address;
+                undo.slot = entry.slot;
+                undo.before = entry.before;
+                break;
+            default:
+                return;
+            }
+            applyUndo(undo);
+        }
+
+        bool findRecord(const std::string &tableName,
+                        const Record &record,
+                        BlockAddress &addrOut,
+                        std::size_t &slotOut) {
+            auto &table = getTable(tableName);
+            for (const auto &addr : table.blocks()) {
+                auto fetchResult = buffer_.fetch(addr, false);
+                fetchResult.block.ensureInitialized(blockSize_);
+                const auto slots = fetchResult.block.slotCount();
+                for (std::size_t i = 0; i < slots; ++i) {
+                    const Record *candidate = fetchResult.block.getRecord(i);
+                    if (candidate && candidate->values == record.values) {
+                        addrOut = addr;
+                        slotOut = i;
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         void applyUndo(const UndoEntry &entry) {
             switch (entry.type) {
             case UndoType::Insert: {
@@ -998,6 +1290,10 @@ namespace dbms {
         return pathutil::join(pathutil::join(root, "logs"), "operations.log");
     }
 
+    static std::string walFilePath(const std::string &root) {
+        return pathutil::join(pathutil::join(root, "logs"), "wal.log");
+    }
+
 
     void ensureRecordFits(const TableSchema &schema,
                           const Record &record) const {
@@ -1035,6 +1331,7 @@ namespace dbms {
     DataDictionary dictionary_;
     AccessPlanCache planCache_;
     LogBuffer logBuffer_;
+    WriteAheadLog wal_;
     std::unordered_map<std::string, Table> tables_;
     std::unordered_map<std::string, BPlusTreeIndex> indexes_;
     std::unordered_map<std::string, std::vector<std::string>> indexesByTable_;
@@ -1044,7 +1341,13 @@ namespace dbms {
     bool transactionActive_{false};
     bool suppressUndo_{false};
     bool applyingUndo_{false};
+    bool suppressWal_{false};
+    std::optional<std::size_t> currentTxnId_;
+    std::size_t nextTxnId_{1};
     std::vector<UndoEntry> undoLog_;
+    std::vector<WriteAheadLog::Entry> pendingWalEntries_;
+    std::unordered_set<std::string> walTables_;
+    bool recoveryPerformed_{false};
 
     std::size_t accessPlanBytes_{0};
     std::size_t dictionaryBytes_{0};
