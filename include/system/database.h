@@ -26,6 +26,31 @@
 namespace dbms {
 
     class DatabaseSystem {
+        class ScopedFlagGuard {
+        public:
+            ScopedFlagGuard(bool &flag, bool value) : flag_(flag), previous_(flag) {
+                flag_ = value;
+            }
+
+            ~ScopedFlagGuard() {
+                flag_ = previous_;
+            }
+
+        private:
+            bool &flag_;
+            bool previous_;
+        };
+
+        enum class UndoType { Insert, Delete, Update };
+
+        struct UndoEntry {
+            UndoType type;
+            BlockAddress address;
+            std::size_t slot{0};
+            std::optional<Record> before;
+            std::optional<Record> after;
+        };
+
     public:
         struct TableDumpRow {
             std::size_t blockIndex{0};
@@ -134,6 +159,48 @@ namespace dbms {
             return buffer_;
         }
 
+        bool inTransaction() const {
+            return transactionActive_;
+        }
+
+        void beginTransaction() {
+            if (transactionActive_) {
+                throw std::runtime_error("transaction already in progress");
+            }
+            transactionActive_ = true;
+            undoLog_.clear();
+            logBuffer_.append("begin");
+        }
+
+        void commitTransaction() {
+            if (!transactionActive_) {
+                throw std::runtime_error("no active transaction to commit");
+            }
+            undoLog_.clear();
+            transactionActive_ = false;
+            logBuffer_.append("commit");
+            logBuffer_.flushToDisk();
+            buffer_.flush();
+        }
+
+        void rollbackTransaction() {
+            if (!transactionActive_) {
+                throw std::runtime_error("no active transaction to rollback");
+            }
+            {
+                ScopedFlagGuard undoGuard(suppressUndo_, true);
+                ScopedFlagGuard applyingGuard(applyingUndo_, true);
+                for (auto it = undoLog_.rbegin(); it != undoLog_.rend(); ++it) {
+                    applyUndo(*it);
+                }
+            }
+            undoLog_.clear();
+            transactionActive_ = false;
+            logBuffer_.append("rollback");
+            logBuffer_.flushToDisk();
+            buffer_.flush();
+        }
+
 
     void insertRecord(const std::string &tableName, Record record) {
         auto &table = getTable(tableName);
@@ -144,30 +211,30 @@ namespace dbms {
             VariableLengthPage::kSlotOverheadBytes;
         if (footprint > blockSize_) {
             std::ostringstream oss;
-                oss << "record does not fit into a single block (requires "
-                    << footprint << " bytes, block size is " << blockSize_ << ")";
+            oss << "record does not fit into a single block (requires "
+                << footprint << " bytes, block size is " << blockSize_ << ")";
+            throw std::runtime_error(oss.str());
+        }
+        if (table.blocks().empty()) {
+            auto addr = disk_.allocateBlock(tableName);
+            table.addBlock(addr);
+        }
+
+        auto fetchResult = buffer_.fetch(table.lastBlock(), true);
+        fetchResult.block.ensureInitialized(blockSize_);
+        Block *targetBlock = &fetchResult.block;
+        if (!targetBlock->hasSpaceFor(record)) {
+            auto addr = disk_.allocateBlock(tableName);
+            table.addBlock(addr);
+            auto newFetch = buffer_.fetch(addr, true);
+            newFetch.block.ensureInitialized(blockSize_);
+            targetBlock = &newFetch.block;
+            if (!targetBlock->hasSpaceFor(record)) {
+                std::ostringstream oss;
+                oss << "record cannot be placed even in an empty block for "
+                    << tableName;
                 throw std::runtime_error(oss.str());
             }
-            if (table.blocks().empty()) {
-                auto addr = disk_.allocateBlock(tableName);
-                table.addBlock(addr);
-            }
-
-            auto fetchResult = buffer_.fetch(table.lastBlock(), true);
-            fetchResult.block.ensureInitialized(blockSize_);
-            Block *targetBlock = &fetchResult.block;
-            if (!targetBlock->hasSpaceFor(record)) {
-                auto addr = disk_.allocateBlock(tableName);
-                table.addBlock(addr);
-                auto newFetch = buffer_.fetch(addr, true);
-                newFetch.block.ensureInitialized(blockSize_);
-                targetBlock = &newFetch.block;
-                if (!targetBlock->hasSpaceFor(record)) {
-                    std::ostringstream oss;
-                    oss << "record cannot be placed even in an empty block for "
-                        << tableName;
-                    throw std::runtime_error(oss.str());
-                }
         }
         auto slotId = targetBlock->insertRecord(std::move(record));
         if (!slotId.has_value()) {
@@ -189,8 +256,20 @@ namespace dbms {
         dictionary_.updateTableStats(tableName,
                                      table.totalRecords(),
                                      table.blockCount());
-        planCache_.recordPlan("INSERT INTO " + tableName);
-        logBuffer_.append("insert into " + tableName);
+        if (transactionActive_ && !suppressUndo_) {
+            UndoEntry entry;
+            entry.type = UndoType::Insert;
+            entry.address = targetBlock->address;
+            entry.slot = *slotId;
+            if (stored) {
+                entry.after = *stored;
+            }
+            undoLog_.push_back(std::move(entry));
+        }
+        if (!applyingUndo_) {
+            planCache_.recordPlan("INSERT INTO " + tableName);
+            logBuffer_.append("insert into " + tableName);
+        }
         persistIndexesForTable(tableName);
     }
 
@@ -235,8 +314,18 @@ namespace dbms {
             fetchResult.block.updateRecord(slotIndex, std::move(record));
         if (success) {
             applyIndexUpdate(addr.table, before, newRecordCopy, addr, slotIndex);
-            planCache_.recordPlan("UPDATE " + addr.table);
-            logBuffer_.append("update " + addr.table);
+            if (transactionActive_ && !suppressUndo_) {
+                UndoEntry entry;
+                entry.type = UndoType::Update;
+                entry.address = addr;
+                entry.slot = slotIndex;
+                entry.before = before;
+                undoLog_.push_back(std::move(entry));
+            }
+            if (!applyingUndo_) {
+                planCache_.recordPlan("UPDATE " + addr.table);
+                logBuffer_.append("update " + addr.table);
+            }
             persistIndexesForTable(addr.table);
         }
         return success;
@@ -254,13 +343,23 @@ namespace dbms {
         if (success) {
             if (before.has_value()) {
                 applyIndexDelete(addr.table, *before);
+                if (transactionActive_ && !suppressUndo_) {
+                    UndoEntry entry;
+                    entry.type = UndoType::Delete;
+                    entry.address = addr;
+                    entry.slot = slotIndex;
+                    entry.before = *before;
+                    undoLog_.push_back(std::move(entry));
+                }
             }
             table.decrementRecords();
             dictionary_.updateTableStats(addr.table,
                                          table.totalRecords(),
                                          table.blockCount());
-            planCache_.recordPlan("DELETE FROM " + addr.table);
-            logBuffer_.append("delete from " + addr.table);
+            if (!applyingUndo_) {
+                planCache_.recordPlan("DELETE FROM " + addr.table);
+                logBuffer_.append("delete from " + addr.table);
+            }
             persistIndexesForTable(addr.table);
         }
         return success;
@@ -545,6 +644,67 @@ namespace dbms {
         }
 
     private:
+        void applyUndo(const UndoEntry &entry) {
+            switch (entry.type) {
+            case UndoType::Insert: {
+                bool removed = deleteRecord(entry.address, entry.slot);
+                if (!removed && entry.after.has_value()) {
+                    removeMatchingRecord(entry.address.table, *entry.after);
+                }
+                break;
+            }
+            case UndoType::Delete: {
+                if (entry.before.has_value()) {
+                    if (!restoreDeletedRecord(entry.address, entry.slot, *entry.before)) {
+                        insertRecord(entry.address.table, *entry.before);
+                    }
+                }
+                break;
+            }
+            case UndoType::Update: {
+                if (entry.before.has_value()) {
+                    updateRecord(entry.address, entry.slot, *entry.before);
+                }
+                break;
+            }
+            }
+        }
+
+        bool restoreDeletedRecord(const BlockAddress &addr,
+                                  std::size_t slotIndex,
+                                  const Record &record) {
+            auto &table = getTable(addr.table);
+            auto fetchResult = buffer_.fetch(addr, true);
+            fetchResult.block.ensureInitialized(blockSize_);
+            if (!fetchResult.block.restoreDeletedRecord(slotIndex)) {
+                return false;
+            }
+            applyIndexInsert(addr.table, record, addr, slotIndex);
+            table.incrementRecords();
+            dictionary_.updateTableStats(addr.table,
+                                         table.totalRecords(),
+                                         table.blockCount());
+            persistIndexesForTable(addr.table);
+            return true;
+        }
+
+        bool removeMatchingRecord(const std::string &tableName,
+                                  const Record &target) {
+            auto &table = getTable(tableName);
+            for (const auto &addr : table.blocks()) {
+                auto fetchResult = buffer_.fetch(addr, false);
+                fetchResult.block.ensureInitialized(blockSize_);
+                const auto slots = fetchResult.block.slotCount();
+                for (std::size_t i = 0; i < slots; ++i) {
+                    const Record *candidate = fetchResult.block.getRecord(i);
+                    if (candidate && candidate->values == target.values) {
+                        return deleteRecord(addr, i);
+                    }
+                }
+            }
+            return false;
+        }
+
 
     std::vector<std::pair<std::string, IndexPointer>>
     collectIndexEntries(const std::string &tableName,
@@ -881,6 +1041,10 @@ namespace dbms {
     std::string indexCatalogFile_;
     std::unordered_map<std::string, IndexDefinition> indexDefinitions_;
     std::unordered_map<std::string, std::vector<std::string>> pendingIndexLoadsByTable_;
+    bool transactionActive_{false};
+    bool suppressUndo_{false};
+    bool applyingUndo_{false};
+    std::vector<UndoEntry> undoLog_;
 
     std::size_t accessPlanBytes_{0};
     std::size_t dictionaryBytes_{0};

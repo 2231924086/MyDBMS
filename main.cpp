@@ -433,6 +433,7 @@ void printHelp() {
     std::cout << "  CREATE INDEX idx ON table(column)       - build B+tree index\n";
     std::cout << "  INSERT INTO table VALUES (v1, v2, ...)  - append a record\n";
     std::cout << "  SELECT ...                              - run a query (supports joins, sort, agg)\n";
+    std::cout << "  BEGIN / COMMIT / ROLLBACK               - transaction control\n";
     std::cout << "  TABLES                                  - list registered tables\n";
     std::cout << "  INDEXES                                 - list indexes\n";
     std::cout << "  DUMP <table> [limit [offset]]           - dump raw table rows\n";
@@ -569,6 +570,33 @@ int main(int argc, char **argv) {
             }
             if (startsWithCaseInsensitive(line, "help")) {
                 printHelp();
+                continue;
+            }
+            if (startsWithCaseInsensitive(line, "begin")) {
+                try {
+                    db.beginTransaction();
+                    std::cout << "Transaction started.\n";
+                } catch (const std::exception &ex) {
+                    std::cout << "BEGIN failed: " << ex.what() << "\n";
+                }
+                continue;
+            }
+            if (startsWithCaseInsensitive(line, "commit")) {
+                try {
+                    db.commitTransaction();
+                    std::cout << "Transaction committed.\n";
+                } catch (const std::exception &ex) {
+                    std::cout << "COMMIT failed: " << ex.what() << "\n";
+                }
+                continue;
+            }
+            if (startsWithCaseInsensitive(line, "rollback")) {
+                try {
+                    db.rollbackTransaction();
+                    std::cout << "Transaction rolled back.\n";
+                } catch (const std::exception &ex) {
+                    std::cout << "ROLLBACK failed: " << ex.what() << "\n";
+                }
                 continue;
             }
             if (startsWithCaseInsensitive(line, "tables")) {

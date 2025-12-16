@@ -3,6 +3,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -183,6 +184,24 @@ DatabaseSystem buildSampleDatabase() {
 
     db.createIndex("idx_users_id", "users", "id");
     return db;
+}
+
+std::optional<std::pair<BlockAddress, std::size_t>> findRecordById(DatabaseSystem& db,
+                                                                   const std::string& table,
+                                                                   const std::string& id) {
+    const Table& t = db.getTable(table);
+    for (const auto& addr : t.blocks()) {
+        auto fetch = db.buffer().fetch(addr, false);
+        fetch.block.ensureInitialized(db.blockSize());
+        const auto slots = fetch.block.slotCount();
+        for (std::size_t i = 0; i < slots; ++i) {
+            const Record* rec = fetch.block.getRecord(i);
+            if (rec && !rec->values.empty() && rec->values[0] == id) {
+                return std::make_pair(addr, i);
+            }
+        }
+    }
+    return std::nullopt;
 }
 
 void testIndexScanAndJoinPipeline() {
@@ -451,6 +470,88 @@ void testPlanCacheEvictionUnderCapacity() {
     require(afterEvict.size() == 1, "plan cache should evict oldest plan when full");
     require(afterEvict[0].find("INSERT INTO t2") != std::string::npos,
             "plan cache should retain most recent plan");
+}
+
+void testTransactionRollback() {
+    const fs::path tempRoot = fs::current_path() / "tmp_dbms_tests" / "tx_rollback";
+    removeIfExists(tempRoot);
+    WorkingDirGuard guard(tempRoot);
+    removeIfExists("storage");
+
+    DatabaseSystem db = buildSampleDatabase();
+    const auto baseline = db.getTable("users").totalRecords();
+
+    db.beginTransaction();
+    db.insertRecord("users", Record{"99", "Temp", "99"});
+
+    auto deletePtr = db.searchIndex("idx_users_id", "1");
+    require(deletePtr.has_value(), "expected idx_users_id to be present");
+    db.deleteRecord(deletePtr->address, deletePtr->slot);
+
+    auto updatePtr = findRecordById(db, "users", "2");
+    require(updatePtr.has_value(), "id=2 should exist before update");
+    db.updateRecord(updatePtr->first, updatePtr->second, Record{"2", "Bobby", "43"});
+
+    db.rollbackTransaction();
+
+    auto dump = db.dumpTable("users");
+    require(dump.totalRecords == baseline, "rollback should restore record count");
+    bool hasId1 = false;
+    bool hasId99 = false;
+    std::string id2Name;
+    for (const auto &row : dump.rows) {
+        if (!row.values.empty()) {
+            if (row.values[0] == "1") {
+                hasId1 = true;
+            } else if (row.values[0] == "99") {
+                hasId99 = true;
+            } else if (row.values[0] == "2") {
+                id2Name = row.values[1];
+            }
+        }
+    }
+    require(hasId1, "rollback should restore deleted row");
+    require(!hasId99, "rolled back insert should not persist");
+    require(id2Name == "Bob", "rollback should undo updates inside the transaction");
+}
+
+void testTransactionCommit() {
+    const fs::path tempRoot = fs::current_path() / "tmp_dbms_tests" / "tx_commit";
+    removeIfExists(tempRoot);
+    WorkingDirGuard guard(tempRoot);
+    removeIfExists("storage");
+
+    DatabaseSystem db = buildSampleDatabase();
+    const auto baseOrders = db.getTable("orders").totalRecords();
+
+    db.beginTransaction();
+    db.insertRecord("orders", Record{"2000", "1", "777"});
+    auto updatePtr = db.searchIndex("idx_users_id", "3");
+    require(updatePtr.has_value(), "users index should be available for updates");
+    db.updateRecord(updatePtr->address, updatePtr->slot, Record{"3", "Carolyn", "28"});
+    db.commitTransaction();
+
+    auto ordersDump = db.dumpTable("orders");
+    require(ordersDump.totalRecords == baseOrders + 1,
+            "committed insert should increase row count");
+    bool foundOrder = false;
+    for (const auto &row : ordersDump.rows) {
+        if (!row.values.empty() && row.values[0] == "2000") {
+            foundOrder = true;
+            break;
+        }
+    }
+    require(foundOrder, "committed order insert must persist");
+
+    auto usersDump = db.dumpTable("users");
+    std::string nameFor3;
+    for (const auto &row : usersDump.rows) {
+        if (!row.values.empty() && row.values[0] == "3") {
+            nameFor3 = row.values[1];
+            break;
+        }
+    }
+    require(nameFor3 == "Carolyn", "committed update should persist after commit");
 }
 
 void testBufferEvictionFlushesDirtyPage() {
@@ -901,6 +1002,8 @@ int main() {
     runner.run("Insert exceeding block capacity is rejected", testInsertRecordTooLarge);
     runner.run("Complex predicate filter evaluation", testComplexPredicateFilterExecution);
     runner.run("Access plan cache evicts when over capacity", testPlanCacheEvictionUnderCapacity);
+    runner.run("Transaction rollback restores state", testTransactionRollback);
+    runner.run("Transaction commit persists changes", testTransactionCommit);
     runner.run("Buffer eviction flushes dirty pages", testBufferEvictionFlushesDirtyPage);
     runner.run("Disk full prevents further inserts", testDiskFullStopsInsertion);
     runner.run("Corrupted data block is detected", testCorruptedDataFileDetection);
